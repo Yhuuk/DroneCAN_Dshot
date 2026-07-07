@@ -1,0 +1,16 @@
+# Local editor and CubeMX workspace metadata
+.vscode/
+.mxproject
+
+# Keil/uVision user interface state
+*.uvguix.*
+
+# Keil build output directory
+MDK-ARM/DroneCAN_Dshot/
+
+# Generated assembler listings
+MDK-ARM/*.lst
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
