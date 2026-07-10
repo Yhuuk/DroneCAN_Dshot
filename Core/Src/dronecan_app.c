@@ -15,6 +15,9 @@
  *   - 启动 CAN 接收；
  *   - 管理 libcanard 实例和回调函数；
  *   - 后续把收到的 CAN frame 转换成 DroneCAN transfer。
+ *
+ * 本阶段补充：HAL CAN -> libcanard 的接收桥接已经接入；
+ * 具体 DroneCAN 数据类型仍然先不接收。
  */
 
 /*
@@ -39,8 +42,37 @@
  */
 #define DRONECAN_APP_MEM_POOL_SIZE       2048U
 
+/*
+ * CAN RX 软件队列长度。
+ *
+ * HAL 的 RX FIFO 很小，中断里应尽快把硬件 FIFO 读空；但 DroneCAN/libcanard
+ * 的协议处理放在主循环里做更稳妥，所以这里加一个小 ring buffer 作为中间层。
+ *
+ * 这个队列使用“空一格”的环形队列写法，所以实际最多缓存
+ * DRONECAN_APP_RX_QUEUE_SIZE - 1 帧。队列满时会丢弃新帧，并增加
+ * g_rx_queue_overflow_count，后续调试时可以在 debugger 里观察它。
+ */
+#define DRONECAN_APP_RX_QUEUE_SIZE       16U
+
+//timestamp_usec 是一个 64 位的时间戳，单位是微秒。这个时间戳是 libcanard 用来计算传输超时的。
+//DroneCAN_RxQueueItem 是一个结构体，表示从 CAN 接收队列中取出的一帧数据。它包含了 CAN 帧的头信息、数据和时间戳。
+typedef struct
+{
+  CAN_RxHeaderTypeDef header;
+  uint8_t data[CANARD_CAN_FRAME_MAX_DATA_LEN];
+  uint64_t timestamp_usec;
+} DroneCAN_RxQueueItem;
+
 static CanardInstance g_canard;
 static uint8_t g_canard_mem_pool[DRONECAN_APP_MEM_POOL_SIZE];
+
+// g_rx_queue 是一个环形队列，用于缓存从 CAN 接收的帧。它的大小是 DRONECAN_APP_RX_QUEUE_SIZE。
+static DroneCAN_RxQueueItem g_rx_queue[DRONECAN_APP_RX_QUEUE_SIZE];
+
+//g_rx_queue_head 是环形队列的头索引，表示下一个要写入的位置。g_rx_queue_tail 是环形队列的尾索引，表示下一个要读取的位置。g_rx_queue_overflow_count 是一个计数器，记录在队列满时丢弃的帧数。
+static volatile uint8_t g_rx_queue_head = 0U;
+static volatile uint8_t g_rx_queue_tail = 0U;
+static volatile uint32_t g_rx_queue_overflow_count = 0U;
 
 static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                         CanardRxTransfer* transfer);
@@ -51,9 +83,26 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
                                           uint8_t source_node_id);
 static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void);
 
+//DroneCAN_RxQueueNextIndex是要用记录队列的下一个索引。这个函数的作用是计算环形队列的下一个索引，确保索引在队列大小范围内循环。
+static uint8_t DroneCAN_RxQueueNextIndex(uint8_t index);
+
+//DroneCAN_RxQueuePushFromIsr是从中断服务例程中调用的函数，用于将接收到的 CAN 帧推入 RX 队列。这个函数会检查队列是否已满，如果满了就丢弃新帧并增加溢出计数，否则将新帧写入队列。
+static bool DroneCAN_RxQueuePushFromIsr(const CAN_RxHeaderTypeDef* rx_header,
+                                        const uint8_t* rx_data,
+                                        uint64_t timestamp_usec);
+
+//DroneCAN_RxQueuePop是从主循环中调用的函数，用于从 RX 队列中弹出一帧 CAN 数据。如果队列为空，返回 false；如果有数据，返回 true 并将数据写入 out_item。
+static bool DroneCAN_RxQueuePop(DroneCAN_RxQueueItem* out_item);
+
+//DroneCAN_BuildCanardFrame是将 DroneCAN_RxQueueItem 转换为 libcanard 的 CanardCANFrame 的函数。这个函数会根据 DroneCAN 帧的 ID 和数据长度，填充 CanardCANFrame 的各个字段。
+static bool DroneCAN_BuildCanardFrame(const DroneCAN_RxQueueItem* item,
+                                      CanardCANFrame* out_frame);
+
+//DroneCAN_GetTimestampUsec是获取当前时间戳的函数，返回值是一个 64 位的微秒时间戳。这个时间戳用于 libcanard 的传输超时计算。                                      
+static uint64_t DroneCAN_GetTimestampUsec(void);
+
 
 /**
- * 
  * typedef enum
  * {
  *  HAL_OK       = 0x00,
@@ -72,6 +121,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
    * 真正启动 CAN 外设是在后面的 HAL_CAN_Start()。
    */
   //现在代码还没有调用 canardHandleRxFrame()，所以这个池子基本只是初始化好了，还没真正忙起来。
+  //本阶段补充：canardHandleRxFrame() 已经在 DroneCAN_App_Poll() 中调用；内存池开始用于 libcanard 的 RX 解析状态。
   canardInit(&g_canard,
              g_canard_mem_pool,
              sizeof(g_canard_mem_pool),
@@ -79,7 +129,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
              DroneCAN_ShouldAcceptTransfer,
              NULL);
 
-  //g_canard 是 libcanard 的实例，里面有 node_id 字段。这里设置本节点的 Node ID。
+  //g_canard 是 libcanard 的实例，里面有 node_id 字段。这里设置本节点的 Node ID。实例就是一个结构体，g_canard就是这个结构体变量，里面有各种状态和配置参数。node_id 就是 libcanard 里用来标识本节点的 ID。
   //g_canard.node_id = DRONECAN_APP_NODE_ID;这个是什么意思
   canardSetLocalNodeID(&g_canard, DRONECAN_APP_NODE_ID);
 
@@ -100,7 +150,8 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
     return HAL_ERROR;
   }
 
-  //HAL_CAN_ActivateNotification()是打开中断 这个函数的第二个参数是一个位掩码，指定要打开哪些 CAN 中断。CAN_IT_RX_FIFO0_MSG_PENDING 是其中一个中断源，表示当 FIFO0 里至少有一帧 CAN 数据时触发。
+  //HAL_CAN_ActivateNotification()是打开中断 这个函数的第二个参数是一个位掩码，指定要打开哪些 CAN 中断。
+  //CAN_IT_RX_FIFO0_MSG_PENDING 是其中一个中断源，表示当 FIFO0 里至少有一帧 CAN 数据时触发。就是有数据就会触发
   if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
   {
     return HAL_ERROR;
@@ -111,16 +162,48 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
 
 void DroneCAN_App_Poll(void)
 {
+  DroneCAN_RxQueueItem item;
+
   /*
    * 当前第一步还没有接入周期任务。
    *
    * 下一步会添加一个小的 CAN RX 队列。到时候这个 Poll 函数会把队列里的
    * CAN frame 取出来，再交给 canardHandleRxFrame() 做 DroneCAN 协议解析。
+   *
+   * 本阶段补充：RX 队列已经接入。现在 Poll 会从 ring buffer 取出 CAN 帧，
+   * 转换成 libcanard 的 CanardCANFrame，然后调用 canardHandleRxFrame()。
+   * 目前 DroneCAN_ShouldAcceptTransfer() 仍然返回 false，所以 libcanard 会解析
+   * 帧头和 transfer 信息，但还不会真正接收 RawCommand 等具体数据类型。
    */
+  while (DroneCAN_RxQueuePop(&item))
+  {
+    //CanardCANFrame的字段分别是：id、data、data_len、iface_id、iface_mask、canfd。这个函数会把 DroneCAN_RxQueueItem 里的 header 和 data 转换成 CanardCANFrame 的各个字段。
+    //canfd是一个布尔值，表示这个帧是否是 CAN FD 帧。当前这个项目只使用经典 CAN，所以 canfd 设置为 false。
+    //iface_mask是一个位掩码，表示这个帧来自哪些 CAN 接口。当前只有一个 CAN 接口（CAN1），所以 iface_mask 设置为 0。
+    CanardCANFrame frame;
+    int16_t result;
+
+    if (DroneCAN_BuildCanardFrame(&item, &frame))
+    {
+      //canardHandleRxFrame()是canard库的一个函数，用于处理接收到的 CAN 帧。它会根据帧的 ID 和数据长度，解析出 DroneCAN transfer，并调用应用层的回调函数。
+      //result是canardHandleRxFrame()的返回值，表示函数执行的状态。返回值是一个 int16_t 类型的整数，可能是正数、零或负数。正数表示成功处理了多少字节的数据，零表示没有处理任何数据，负数表示发生了错误。
+      result = canardHandleRxFrame(&g_canard,
+                                   &frame,
+                                   item.timestamp_usec);
+      /*
+       * 当前阶段只把帧送进 libcanard，还不根据返回值做错误统计。
+       * 因为 ShouldAcceptTransfer() 暂时返回 false，收到 DroneCAN 帧时
+       * 常见返回值会是 CANARD_ERROR_RX_NOT_WANTED 的负值，这是预期现象。
+       */
+      (void)result;
+    }
+  }
 }
 
 // HAL_CAN_RxFifo0MsgPendingCallback()是 HAL CAN driver 的一个回调函数。当 CAN1 的 RX FIFO0 里至少有一帧 CAN 数据时，HAL 会调用这个函数。这个函数的作用是把 FIFO0 里的所有帧都读出来，并暂时丢弃。
+//本阶段补充：现在读出来后不再丢弃，而是写入 RX ring buffer，等待主循环交给 libcanard。
 //为什么要读空？因为 RX pending 标志只有在实际读出 FIFO 后才会清掉。如果不读，CAN 中断会一直反复进入
+//HAL_CAN_RxFifo0MsgPendingCallback()是官方中断回调函数， HAL_CAN_IRQHandler(&hcan1);回调函数的入口
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 {
   CAN_RxHeaderTypeDef rx_header;
@@ -153,9 +236,139 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 
     //CAN header 和 data分别是什么 目前还没有用到，先显式标记未使用，避免编译器警告。
     //rx_header 和 rx_data 就会被真正转换成 CanardCANFrame
-    (void)rx_header;   //这是 C 语言里常见的“显式标记未使用”的写法，目前就是占位
-    (void)rx_data;
+    //本阶段补充：这里已经从“读出后丢弃”改成“写入 RX ring buffer”。
+    //中断里只做轻量工作，真正调用 libcanard 的 canardHandleRxFrame() 放在 DroneCAN_App_Poll()。
+    (void)DroneCAN_RxQueuePushFromIsr(&rx_header,
+                                      rx_data,
+                                      DroneCAN_GetTimestampUsec());
   }
+}
+
+static uint8_t DroneCAN_RxQueueNextIndex(uint8_t index)
+{
+  index++;
+  if (index >= DRONECAN_APP_RX_QUEUE_SIZE)
+  {
+    index = 0U;
+  }
+
+  return index;
+}
+
+static bool DroneCAN_RxQueuePushFromIsr(const CAN_RxHeaderTypeDef* rx_header,
+                                        const uint8_t* rx_data,
+                                        uint64_t timestamp_usec)
+{
+  uint8_t next_head;
+  DroneCAN_RxQueueItem* item;
+  uint8_t i;
+
+  //next_head得到的是g_rx_queue_head的下一个索引
+  //这里是空一帧的环形队列写法。g_rx_queue_head指向下一个要写入的位置，g_rx_queue_tail指向下一个要读取的位置。如果 next_head 等于 g_rx_queue_tail，说明队列满了。
+  next_head = DroneCAN_RxQueueNextIndex(g_rx_queue_head);
+  if (next_head == g_rx_queue_tail)
+  {
+    /*
+     * 队列满时丢弃最新帧。这里不能阻塞等待主循环消费，否则会把 CAN 中断
+     * 卡住，反而更容易造成硬件 FIFO 溢出。
+     */
+    g_rx_queue_overflow_count++;
+    return false;
+  }
+
+  item = &g_rx_queue[g_rx_queue_head];
+  item->header = *rx_header;
+  item->timestamp_usec = timestamp_usec;
+
+  for (i = 0U; i < CANARD_CAN_FRAME_MAX_DATA_LEN; i++)
+  {
+    item->data[i] = rx_data[i];
+  }
+
+  /*
+   * head 最后更新。这样主循环只有在一帧 header/data/timestamp 都写完之后，
+   * 才可能看到这个新队列项。
+   */
+  g_rx_queue_head = next_head;
+  return true;
+}
+
+// DroneCAN_RxQueuePop是从主循环中调用的函数，用于从 RX 队列中弹出一帧 CAN 数据。如果队列为空，返回 false；如果有数据，返回 true 并将数据写入 out_item。
+static bool DroneCAN_RxQueuePop(DroneCAN_RxQueueItem* out_item)
+{
+  //g_rx_queue_tail == g_rx_queue_head 表示队列为空。因为 head 指向下一个要写入的位置，tail 指向下一个要读取的位置。如果两者相等，说明没有数据可读。
+  if (g_rx_queue_tail == g_rx_queue_head)
+  {
+    return false;
+  }
+
+  //读的话是main loop，写的话是中断。这里不需要临界区保护，因为 head/tail 的更新是原子操作，而且中断里只写 head，主循环只读 tail。
+  //out_item是地址，*out_item是解引用，表示把队列里的数据拷贝到 out_item 指向的内存里。g_rx_queue[g_rx_queue_tail] 是当前 tail 指向的队列项。
+  *out_item = g_rx_queue[g_rx_queue_tail];
+  g_rx_queue_tail = DroneCAN_RxQueueNextIndex(g_rx_queue_tail);
+  return true;
+}
+
+static bool DroneCAN_BuildCanardFrame(const DroneCAN_RxQueueItem* item,
+                                      CanardCANFrame* out_frame)
+{
+  CanardCANFrame frame = {0};
+  uint8_t i;
+
+  /*
+   * DroneCAN 使用 29-bit extended data frame。
+   * 硬件 filter 当前故意放宽为“全部接收”，所以这里在软件桥接层丢弃
+   * standard frame 和 remote frame，避免把非 DroneCAN 帧交给 libcanard。
+   */
+  //header.IDE是CAN帧的标识符扩展位，表示是否使用扩展ID。CAN_ID_EXT是一个宏(表示扩展ID的值)，表示扩展ID的值。如果不是扩展ID，就返回false，表示不接受这个帧。
+  if (item->header.IDE != CAN_ID_EXT)
+  {
+    return false;
+  }
+
+  //header.RTR是CAN帧的远程传输请求位，表示是否是远程帧。CAN_RTR_DATA是一个宏，表示数据帧的值。如果不是数据帧，就返回false，表示不接受这个帧。
+  if (item->header.RTR != CAN_RTR_DATA)
+  {
+    return false;
+  }
+
+  //header.DLC是CAN帧的数据长度码，表示数据字段的字节数。CANARD_CAN_FRAME_MAX_DATA_LEN是libcanard定义的最大数据长度。如果DLC大于最大数据长度，就返回false，表示不接受这个帧。
+  if (item->header.DLC > CANARD_CAN_FRAME_MAX_DATA_LEN)
+  {
+    return false;
+  }
+
+  //header.ExtId
+  //CANARD_CAN_EXT_ID_MASK是libcanard定义的掩码，用于提取扩展ID的有效位。CANARD_CAN_FRAME_EFF是libcanard定义的标志，表示这是一个扩展帧。
+  frame.id = (item->header.ExtId & CANARD_CAN_EXT_ID_MASK) | CANARD_CAN_FRAME_EFF;
+  //长度是0~8字节，DLC是CAN帧的长度码，表示数据字段的字节数。这里把DLC转换成uint8_t类型，赋值给frame.data_len。
+  frame.data_len = (uint8_t)item->header.DLC;
+  //frame.iface_id是libcanard定义的CAN接口ID，表示这个帧来自哪个CAN接口。当前只有一个CAN接口（CAN1），所以设置为0。
+  frame.iface_id = 0U;
+
+  //这里设置成0和1的区别是什么
+  // frame.iface_id = 1U;
+
+  //
+  // frame.canfd = false;
+
+  for (i = 0U; i < frame.data_len; i++)
+  {
+    frame.data[i] = item->data[i];
+  }
+
+  *out_frame = frame;
+  return true;
+}
+
+static uint64_t DroneCAN_GetTimestampUsec(void)
+{
+  /*
+   * libcanard 需要单调递增的微秒时间戳，用于多帧 transfer 超时判断。
+   * 当前先用 HAL_GetTick() 的毫秒 tick 转成微秒，精度不高但足够用于
+   * 这个阶段的接收桥接验证；后续如果要更精细的超时/统计，可以换成硬件定时器。
+   */
+  return ((uint64_t)HAL_GetTick()) * 1000ULL;
 }
 
 static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
