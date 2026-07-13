@@ -22,6 +22,8 @@ extern "C" {
  *
  * 本阶段补充：CAN 帧已经会被转交给 libcanard 解析基础 transfer 信息；
  * RawCommand 解码和 DShot 输出仍然没有接入。
+ * 本阶段再次补充：RawCommand 已能被接受、解码并暂存供调试观察；
+ * DShot 输出仍然没有接入。
  *
  * @retval HAL_OK    DroneCAN 基础层已准备好，可以接收 CAN 中断。
  * @retval HAL_ERROR 启动流程中的某一步失败。

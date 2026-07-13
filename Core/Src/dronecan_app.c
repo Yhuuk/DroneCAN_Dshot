@@ -3,6 +3,8 @@
 #include "can.h"
 #include "canard.h"
 
+#include "uavcan.equipment.esc.RawCommand.h"
+
 /*
  * 本模块是 STM32 HAL CAN driver 和 libcanard 之间的边界层。
  *
@@ -18,7 +20,24 @@
  *
  * 本阶段补充：HAL CAN -> libcanard 的接收桥接已经接入；
  * 具体 DroneCAN 数据类型仍然先不接收。
+ * 本阶段再次补充：ShouldAcceptTransfer 已允许接收 RawCommand 广播，
+ * 但 OnTransferReceived 里的 RawCommand 解码仍未接入。
+ * 本阶段再次补充：OnTransferReceived 已能解码并暂存 RawCommand，
+ * 当前仍然不会驱动 DShot 输出。
  */
+
+ /*
+  在你的工程里，最终路径会是：
+  CAN 原始帧
+  -> HAL_CAN_GetRxMessage()
+  -> CanardCANFrame
+  -> canardHandleRxFrame()
+  -> libcanard 解析成 CanardRxTransfer
+  -> DroneCAN_OnTransferReceived()
+  -> 你的代码解码 RawCommand
+  -> 得到油门值
+  -> 转成 DShot 输出
+*/
 
 /*
  * 调试阶段临时使用的静态 Node ID。
@@ -73,6 +92,19 @@ static DroneCAN_RxQueueItem g_rx_queue[DRONECAN_APP_RX_QUEUE_SIZE];
 static volatile uint8_t g_rx_queue_head = 0U;
 static volatile uint8_t g_rx_queue_tail = 0U;
 static volatile uint32_t g_rx_queue_overflow_count = 0U;
+
+/*
+ * RawCommand 接收调试状态。
+ *
+ * 当前阶段先把最后一次成功解码的命令保存在 RAM 中，方便通过 debugger
+ * 观察 cmd.len 和 cmd.data[]，暂时不把这些油门值交给 DShot。
+ * 变量使用 volatile，避免编译器因为应用代码尚未读取它们而省略更新。
+ * 解码失败时只增加错误计数，不覆盖上一条已经验证有效的命令。
+ */
+static volatile struct uavcan_equipment_esc_RawCommand g_last_raw_command;
+static volatile uint8_t g_last_raw_command_source_node_id = 0U;
+static volatile uint32_t g_raw_command_received_count = 0U;
+static volatile uint32_t g_raw_command_decode_error_count = 0U;
 
 static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                         CanardRxTransfer* transfer);
@@ -404,6 +436,17 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
   return HAL_CAN_ConfigFilter(&hcan1, &filter);
 }
 
+
+//CanardShouldAcceptTransfer这个是libcanard的官方回调函数，DroneCAN_ShouldAcceptTransfer这个是自己命名，但是函数参数格式是官方规定的。
+//什么时候调用：libcanard 内部调用。在哪里注册：canardInit()。
+/**
+ * ins 是 libcanard 的实例指针，但是当前工程只有一个 libcanard 实例（也就是g_canard），所以这个参数暂时没用。
+ * out_data_type_signature 是 libcanard 要求应用层提供的类型签名，用于校验多帧 transfer 的 CRC。
+ * data_type_id 是 DroneCAN 的数据类型 ID，表示这个 transfer 的类型。判断是不是 uavcan.equipment.esc.RawCommand 就是看这个 ID。
+ * transfer_type 是 transfer 的类型，可以是广播、单播等。判断是不是广播消息就看这个参数。
+ * source_node_id 是发送这个 transfer 的节点 ID。比如，飞控 Node ID = 10 当前的转换板 Node ID = 42。如果是匿名节点发送的广播消息，这个值就是 0。
+ * 现在 source_node_id 没用上，就是不限制广播消息来源
+ */
 static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
                                           uint64_t* out_data_type_signature,
                                           uint16_t data_type_id,
@@ -411,17 +454,31 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
                                           uint8_t source_node_id)
 {
   (void)ins;
-  (void)out_data_type_signature;
-  (void)data_type_id;
-  (void)transfer_type;
   (void)source_node_id;
 
   /*
-   * 当前还不接收任何 DroneCAN 数据类型。
+   * libcanard 在收到一个新的 transfer 时，会调用这个回调函数，询问应用层是否要接收这个 transfer。
    *
    * 下一步接好 CAN RX 队列之后，这里会开始接受
    * uavcan.equipment.esc.RawCommand，并返回它的 data type signature。
+   *
+   * 本阶段补充：CAN RX 队列已经接好，现在只接受广播形式的
+   * uavcan.equipment.esc.RawCommand。其他消息和服务仍然返回 false，
+   * 避免 libcanard 为当前应用不需要的数据类型分配接收内存。
    */
+  //CanardTransferTypeBroadcast是libcanard定义的枚举值，表示这个 transfer 是广播类型。
+  if ((transfer_type == CanardTransferTypeBroadcast) &&
+      (data_type_id == UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID))
+  {
+    /*
+     * 当回调返回 true 时，libcanard 要求应用同时提供正确的类型签名。
+     * libcanard 会使用这个签名校验多帧 transfer 的 CRC；签名不正确时，
+     * 即使 CAN 帧已经全部收到，也不能得到一个有效的 RawCommand transfer。
+     */
+    *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
+    return true;
+  }
+
   return false;
 }
 
@@ -430,16 +487,55 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
 才会进这里。当前为空；以后会在这里解码 RawCommand，然后转成电调/DShot 输出。
 */
 
+
+/**
+ * 函数名：我们自定义
+ * 函数参数格式：libcanard 官方规定
+ * 什么时候调用：libcanard 内部调用
+ * 在哪里注册：canardInit()
+ */
+
+ //CanardOnTransferReception是libcanard的官方回调函数类型，DroneCAN_OnTransferReceived是自己命名，但是函数参数格式是官方规定的。
 static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                         CanardRxTransfer* transfer)
 {
+  struct uavcan_equipment_esc_RawCommand raw_command = {0};
+
   (void)ins;
-  (void)transfer;
 
   /*
    * 只有当 DroneCAN_ShouldAcceptTransfer() 返回 true，并且 libcanard 已经把
    * 一个完整 transfer 重组完成后，才会进入这个 callback。
    *
-   * 当前还没有加入 RawCommand 解码，所以这里先保持为空。
+   * 本阶段补充：这里已经接入 RawCommand 解码，但只保存调试数据，
+   * 还不会更新定时器、DMA 或任何 DShot 输出。
    */
+  if ((transfer->transfer_type != CanardTransferTypeBroadcast) ||
+      (transfer->data_type_id != UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID))
+  {
+    /*
+     * ShouldAcceptTransfer 当前只允许 RawCommand 广播。这里再次检查类型，
+     * 是为了让以后增加其他 DroneCAN 数据类型时，各类型仍有明确的处理入口。
+     */
+    return;
+  }
+
+  /*
+   * 生成的 decode 函数返回 false 表示成功，返回 true 表示 Payload 非法。
+   * 它会处理 RawCommand 的 14-bit 有符号数组和多帧 Payload，应用层不需要
+   * 自己按照字节或位偏移解析 transfer。
+   */
+  if (uavcan_equipment_esc_RawCommand_decode(transfer, &raw_command))
+  {
+    g_raw_command_decode_error_count++;
+    return;
+  }
+
+  /*
+   * 只有完整且解码成功的命令才会更新调试状态。received_count 最后增加，
+   * 在 debugger 中看到计数变化时，前面的命令内容和来源 Node ID 已经写好。
+   */
+  g_last_raw_command = raw_command;
+  g_last_raw_command_source_node_id = transfer->source_node_id;
+  g_raw_command_received_count++;
 }
