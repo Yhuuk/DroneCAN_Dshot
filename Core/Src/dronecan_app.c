@@ -2,6 +2,7 @@
 
 #include "can.h"
 #include "canard.h"
+#include "motor_control.h"
 
 #include "uavcan.equipment.esc.RawCommand.h"
 
@@ -24,6 +25,8 @@
  * 但 OnTransferReceived 里的 RawCommand 解码仍未接入。
  * 本阶段再次补充：OnTransferReceived 已能解码并暂存 RawCommand，
  * 当前仍然不会驱动 DShot 输出。
+ * 本阶段再次补充：RawCommand 的前 8 路已经会被映射并保存为 DShot 命令，
+ * 但仍未生成 16-bit DShot 帧，也没有操作定时器或实际输出引脚。
  */
 
  /*
@@ -105,6 +108,7 @@ static volatile struct uavcan_equipment_esc_RawCommand g_last_raw_command;
 static volatile uint8_t g_last_raw_command_source_node_id = 0U;
 static volatile uint32_t g_raw_command_received_count = 0U;
 static volatile uint32_t g_raw_command_decode_error_count = 0U;
+static volatile uint32_t g_raw_command_mapping_error_count = 0U;
 
 static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                         CanardRxTransfer* transfer);
@@ -509,6 +513,8 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
    *
    * 本阶段补充：这里已经接入 RawCommand 解码，但只保存调试数据，
    * 还不会更新定时器、DMA 或任何 DShot 输出。
+   * 本阶段再次补充：解码成功后会把前 8 路交给 motor_control 做安全映射，
+   * 当前仍然只更新 RAM 中的 DShot 命令缓存。
    */
   if ((transfer->transfer_type != CanardTransferTypeBroadcast) ||
       (transfer->data_type_id != UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID))
@@ -528,6 +534,21 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
   if (uavcan_equipment_esc_RawCommand_decode(transfer, &raw_command))
   {
     g_raw_command_decode_error_count++;
+    return;
+  }
+
+  /*
+   * cmd.data[0..7] 分别对应 DShot1..DShot8。少于 8 路时，motor_control
+   * 会把缺少的输出保存为停止；多于 8 路时，本节点只使用前 8 路。
+   * 如果映射失败，motor_control 会把全部输出命令安全置零。
+   */
+  //raw_command.cmd.data 本身是一个数组，raw_command.cmd.len 是数组的长度。
+  //所以传给函数时会自动变成首元素地址
+  if (!MotorControl_UpdateDShotCommands(raw_command.cmd.data,
+                                         raw_command.cmd.len))
+  {
+    //映射失败时只增加错误计数，不覆盖上一条已经验证有效的命令。
+    g_raw_command_mapping_error_count++;
     return;
   }
 

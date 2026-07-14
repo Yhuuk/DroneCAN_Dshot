@@ -24,6 +24,8 @@ extern "C" {
  * RawCommand 解码和 DShot 输出仍然没有接入。
  * 本阶段再次补充：RawCommand 已能被接受、解码并暂存供调试观察；
  * DShot 输出仍然没有接入。
+ * 本阶段再次补充：RawCommand 的前 8 路已映射并保存为 DShot 命令；
+ * 16-bit DShot 帧、定时器/DMA 波形和实际输出仍未接入。
  *
  * @retval HAL_OK    DroneCAN 基础层已准备好，可以接收 CAN 中断。
  * @retval HAL_ERROR 启动流程中的某一步失败。

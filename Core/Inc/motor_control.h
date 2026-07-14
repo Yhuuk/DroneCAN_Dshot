@@ -11,6 +11,9 @@ extern "C" {
 #define MOTOR_CONTROL_RAW_COMMAND_MIN_VALUE  (-8192)
 #define MOTOR_CONTROL_RAW_COMMAND_MAX_VALUE  8191
 
+/* 当前硬件提供 DShot1..DShot8，共 8 路电机输出。 */
+#define MOTOR_CONTROL_DSHOT_OUTPUT_COUNT      8U
+
 /**
  * @brief 把一个 DroneCAN RawCommand 值映射成单向 DShot 命令。
  *
@@ -30,6 +33,36 @@ extern "C" {
  */
 bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
                                        uint16_t* out_dshot_command);
+
+/**
+ * @brief 把一条 RawCommand 中的多路数据映射并保存为 8 路 DShot 命令。
+ *
+ * RawCommand 数组与 DShot 输出按索引一一对应：data[0] 对应 DShot1，
+ * data[1] 对应 DShot2，以此类推。当前硬件最多使用前 8 个元素：
+ *   - 少于 8 路时，缺少的输出保存为 DShot 0（停止）；
+ *   - 多于 8 路时，只处理前 8 路，其余元素由本节点忽略；
+ *   - 数组为空且长度为 0 时，8 路全部保存为停止；
+ *   - 指针无效或任一数值越界时，8 路全部保存为停止并返回 false。
+ *
+ * 该函数只保存 0 或 48..2047 的 DShot 命令值，尚不生成 16-bit 帧，
+ * 也不会操作 TIM、DMA、CCR 或 GPIO。
+ *
+ * @param raw_commands      RawCommand 解码后的 cmd.data 数组。
+ * @param raw_command_count RawCommand 解码后的 cmd.len。
+ *
+ * @retval true  前 8 路范围内的数据全部映射并保存成功。
+ * @retval false 输入无效，8 路命令已安全地全部置为停止。
+ */
+bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
+                                      uint8_t raw_command_count);
+
+/**
+ * @brief 读取一路当前保存的 DShot 命令，供后续帧编码步骤使用。
+ *
+ * @param output_index 输出索引，0..7 分别对应 DShot1..DShot8。
+ * @return 对应的 DShot 命令；索引越界时安全返回 0（停止）。
+ */
+uint16_t MotorControl_GetDShotCommand(uint8_t output_index);
 
 #ifdef __cplusplus
 }
