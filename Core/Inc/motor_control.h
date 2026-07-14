@@ -51,6 +51,8 @@ bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
  * 也不会操作 TIM、DMA、CCR 或 GPIO。
  * 本阶段补充：8 路命令现在会继续编码并保存为 8 个 16-bit DShot 帧；
  * 仍然不会操作 TIM、DMA、CCR 或 GPIO。
+ * 本阶段再次补充：8 个帧现在会继续转换并保存为 8×16 个 CCR 数值；
+ * 这些数值只保存在 RAM 中，尚未写入 TIM 的 CCR 寄存器。
  *
  * @param raw_commands      RawCommand 解码后的 cmd.data 数组。
  * @param raw_command_count RawCommand 解码后的 cmd.len。
@@ -92,6 +94,19 @@ uint16_t MotorControl_GetDShotCommand(uint8_t output_index);
  * @return 对应的完整 16-bit DShot 帧；索引越界时安全返回 0（停止帧）。
  */
 uint16_t MotorControl_GetDShotFrame(uint8_t output_index);
+
+/**
+ * @brief 读取一路DShot输出中某一个bit对应的CCR值。
+ *
+ * 每路保存16个CCR值，bit_index=0对应DShot帧的bit15，bit_index=15对应
+ * bit0。正常返回值是30（逻辑0）或60（逻辑1）。
+ *
+ * @param output_index 输出索引，0..7分别对应DShot1..DShot8。
+ * @param bit_index    发送顺序索引，0..15分别对应帧的bit15..bit0。
+ * @return 对应的CCR值；任一索引越界时返回0。
+ */
+uint32_t MotorControl_GetDShotCcrValue(uint8_t output_index,
+                                       uint8_t bit_index);
 
 #ifdef __cplusplus
 }

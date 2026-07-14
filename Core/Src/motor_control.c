@@ -14,6 +14,13 @@ static volatile uint16_t g_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT];
 static volatile uint16_t g_dshot_frames[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT];
 
 /*
+ * 保存8路DShot帧分别转换得到的16个CCR值。第一维是输出通道，第二维是
+ * 发送顺序；[output][0]对应帧bit15，[output][15]对应帧bit0。
+ */
+static uint32_t
+    g_dshot_ccr_values[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT][DSHOT_FRAME_BIT_COUNT];
+
+/*
  * 这两个状态只在主循环上下文中访问，所以不需要 volatile。
  * g_has_fresh_raw_command 用来区分“从未收到命令/已经超时”和“正在等待超时”。
  */
@@ -26,11 +33,18 @@ static volatile uint32_t g_raw_command_timeout_count;
 static void MotorControl_StopAllDShotCommands(void)
 {
   uint8_t i;
+  uint8_t bit_index;
 
   for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
   {
     g_dshot_commands[i] = 0U;
     g_dshot_frames[i] = 0U;
+
+    /* 停止帧0x0000包含16个逻辑0，所以对应的CCR值都是30，而不是0。 */
+    for (bit_index = 0U; bit_index < DSHOT_FRAME_BIT_COUNT; bit_index++)
+    {
+      g_dshot_ccr_values[i][bit_index] = DSHOT_BIT_0_HIGH_TICKS;
+    }
   }
 }
 
@@ -99,8 +113,10 @@ bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
 {
   uint16_t next_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT] = {0};
   uint16_t next_dshot_frames[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT] = {0};
+  uint32_t next_dshot_ccr_values[DSHOT_FRAME_BIT_COUNT];
   uint8_t command_count_to_map;
   uint8_t i;
+  uint8_t bit_index;
 
   /*
    * 长度为 0 是合法的“没有电机命令”，此时即使指针为空也可以安全地把
@@ -156,8 +172,30 @@ bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
   }
 
   /*
+   * 逐路把完整DShot帧转换成16个CCR值。这里只使用一个16元素局部数组作为
+   * 暂存区，避免在函数栈上创建完整的8×16数组。每一路转换成功后再复制到
+   * 对应的全局缓存；如果发生错误，全部通道都会恢复为停止状态。
+   */
+  for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
+  {
+    if (!DShot_BuildCcrValues(next_dshot_frames[i],
+                              next_dshot_ccr_values))
+    {
+      MotorControl_StopAllDShotCommands();
+      g_has_fresh_raw_command = false;
+      return false;
+    }
+
+    for (bit_index = 0U; bit_index < DSHOT_FRAME_BIT_COUNT; bit_index++)
+    {
+      g_dshot_ccr_values[i][bit_index] =
+          next_dshot_ccr_values[bit_index];
+    }
+  }
+
+  /*
    * 8 路映射和帧编码全部成功后，再一次性更新全局缓存，避免留下部分新数据、
-   * 部分旧数据。命令值供调试观察，完整帧供下一步 CCR 占空比转换使用。
+   * 部分旧数据。命令值、完整帧和对应CCR值现在都可以在RAM中读取和检查。
    */
   for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
   {
@@ -214,4 +252,16 @@ uint16_t MotorControl_GetDShotFrame(uint8_t output_index)
   }
 
   return g_dshot_frames[output_index];
+}
+
+uint32_t MotorControl_GetDShotCcrValue(uint8_t output_index,
+                                       uint8_t bit_index)
+{
+  if ((output_index >= MOTOR_CONTROL_DSHOT_OUTPUT_COUNT) ||
+      (bit_index >= DSHOT_FRAME_BIT_COUNT))
+  {
+    return 0U;
+  }
+
+  return g_dshot_ccr_values[output_index][bit_index];
 }
