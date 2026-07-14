@@ -6,8 +6,22 @@
  * 保存最近一次有效 RawCommand 映射得到的 8 路 DShot 命令。
  * 当前尚未接入帧编码和硬件输出，volatile 用于保证这些调试状态在 RAM 中
  * 保持可观察；后续可以在 Keil debugger 中直接查看每一路的命令值。
+ * 本阶段补充：逻辑帧编码已经接入，但仍未接入 TIM、DMA 和 GPIO 硬件输出。
  */
 static volatile uint16_t g_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT];
+
+/* 保存与 g_dshot_commands 一一对应的 8 个完整 16-bit DShot 帧。 */
+static volatile uint16_t g_dshot_frames[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT];
+
+/*
+ * 这两个状态只在主循环上下文中访问，所以不需要 volatile。
+ * g_has_fresh_raw_command 用来区分“从未收到命令/已经超时”和“正在等待超时”。
+ */
+static uint64_t g_last_raw_command_timestamp_usec;
+static bool g_has_fresh_raw_command;
+
+/* 供 Keil debugger 观察 RawCommand 超时保护实际触发了多少次。 */
+static volatile uint32_t g_raw_command_timeout_count;
 
 static void MotorControl_StopAllDShotCommands(void)
 {
@@ -16,6 +30,7 @@ static void MotorControl_StopAllDShotCommands(void)
   for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
   {
     g_dshot_commands[i] = 0U;
+    g_dshot_frames[i] = 0U;
   }
 }
 
@@ -79,9 +94,11 @@ bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
 }
 
 bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
-                                      uint8_t raw_command_count)
+                                      uint8_t raw_command_count,
+                                      uint64_t timestamp_usec)
 {
   uint16_t next_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT] = {0};
+  uint16_t next_dshot_frames[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT] = {0};
   uint8_t command_count_to_map;
   uint8_t i;
 
@@ -92,6 +109,7 @@ bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
   if ((raw_command_count > 0U) && (raw_commands == NULL))
   {
     MotorControl_StopAllDShotCommands();
+    g_has_fresh_raw_command = false;
     return false;
   }
 
@@ -113,17 +131,69 @@ bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
                                            &next_dshot_commands[i]))
     {
       MotorControl_StopAllDShotCommands();
+      g_has_fresh_raw_command = false;
       return false;
     }
   }
 
-  /* 全部映射成功后，再一次性按顺序更新 8 路已保存的目标命令。 */
+  /*
+   * 把 8 路命令分别编码成完整 DShot 帧。当前阶段不接收电调遥测，所以
+   * request_telemetry 固定为 false。缺少的 RawCommand 通道对应命令 0，
+   * 编码后得到停止帧 0x0000。
+   */
+  //这一步是把映射后的 DShot 命令值编码成完整的 16-bit DShot 帧。任一编码失败，都会导致全部输出安全置零。
+  //如果收到的比8帧少，next_dshot_commands[i]后面没有的就是0，不会被MotorControl_MapRawCommandToDShot索引到，所以这里也会被编码为0x0000
+  for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
+  {
+    if (!DShot_BuildFrame(next_dshot_commands[i],
+                          false,
+                          &next_dshot_frames[i]))
+    {
+      MotorControl_StopAllDShotCommands();
+      g_has_fresh_raw_command = false;
+      return false;
+    }
+  }
+
+  /*
+   * 8 路映射和帧编码全部成功后，再一次性更新全局缓存，避免留下部分新数据、
+   * 部分旧数据。命令值供调试观察，完整帧供下一步 CCR 占空比转换使用。
+   */
   for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
   {
     g_dshot_commands[i] = next_dshot_commands[i];
+    g_dshot_frames[i] = next_dshot_frames[i];
   }
 
+  /*
+   * 只有全部数据映射成功后才刷新时间。这样非法 RawCommand 不会延长上一条有效
+   * 命令的生存时间。长度为 0 的 RawCommand 是合法停止命令，也会重新开始计时。
+   */
+  g_last_raw_command_timestamp_usec = timestamp_usec;
+  g_has_fresh_raw_command = true;
+
   return true;
+}
+
+void MotorControl_Poll(uint64_t now_usec)
+{
+  //g_has_fresh_raw_command =1表示当前有一条有效的 RawCommand，尚未超时；g_has_fresh_raw_command = 0 表示当前没有有效的 RawCommand，或者已经超时。
+  if (!g_has_fresh_raw_command)
+  {
+    return;
+  }
+
+  /*
+   * 使用无符号时间差进行比较，不依赖绝对时间值。达到 100 ms（包括恰好等于）
+   * 就立即停止全部输出；随后清除 fresh 标志，避免同一次超时被重复计数。
+   */
+  if ((now_usec - g_last_raw_command_timestamp_usec) >=
+      MOTOR_CONTROL_RAW_COMMAND_TIMEOUT_USEC)
+  {
+    MotorControl_StopAllDShotCommands();
+    g_has_fresh_raw_command = false;
+    g_raw_command_timeout_count++;
+  }
 }
 
 uint16_t MotorControl_GetDShotCommand(uint8_t output_index)
@@ -134,4 +204,14 @@ uint16_t MotorControl_GetDShotCommand(uint8_t output_index)
   }
 
   return g_dshot_commands[output_index];
+}
+
+uint16_t MotorControl_GetDShotFrame(uint8_t output_index)
+{
+  if (output_index >= MOTOR_CONTROL_DSHOT_OUTPUT_COUNT)
+  {
+    return 0U;
+  }
+
+  return g_dshot_frames[output_index];
 }

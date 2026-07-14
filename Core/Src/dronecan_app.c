@@ -210,6 +210,10 @@ void DroneCAN_App_Poll(void)
    * 转换成 libcanard 的 CanardCANFrame，然后调用 canardHandleRxFrame()。
    * 目前 DroneCAN_ShouldAcceptTransfer() 仍然返回 false，所以 libcanard 会解析
    * 帧头和 transfer 信息，但还不会真正接收 RawCommand 等具体数据类型。
+   * 后续阶段补充：ShouldAcceptTransfer 和 OnTransferReceived 已经实现，现在能够
+   * 接收、解码并映射 RawCommand；上面两行保留为早期阶段记录。
+   * 本阶段补充：主循环每次处理完 RX 队列后都会检查 RawCommand 的 100 ms
+   * 超时保护；超时后 motor_control 会把 8 路 DShot 缓存命令全部置为停止。
    */
   while (DroneCAN_RxQueuePop(&item))
   {
@@ -230,10 +234,20 @@ void DroneCAN_App_Poll(void)
        * 当前阶段只把帧送进 libcanard，还不根据返回值做错误统计。
        * 因为 ShouldAcceptTransfer() 暂时返回 false，收到 DroneCAN 帧时
        * 常见返回值会是 CANARD_ERROR_RX_NOT_WANTED 的负值，这是预期现象。
+       * 后续阶段补充：ShouldAcceptTransfer() 已经接收 RawCommand；这里仍暂时不做
+       * result 错误统计，保留到专门完善 DroneCAN 诊断状态时处理。
        */
       (void)result;
     }
   }
+
+  /*
+   * 超时检查放在主循环，不放在 CAN 中断中。即使当前没有收到新 CAN 帧，
+   * 只要 DroneCAN_App_Poll() 持续运行，100 ms 保护仍然会按时生效。
+   */
+  //RX 队列处理完后调用 MotorControl_Poll()，然后比较的是 当前时间 - 新命令时间。只要收到新的有效命令，超时就会重新开始计数
+  //这个是放在RX 队列处理完后，可以考虑一下这个处理的顺序问题
+  MotorControl_Poll(DroneCAN_GetTimestampUsec());
 }
 
 // HAL_CAN_RxFifo0MsgPendingCallback()是 HAL CAN driver 的一个回调函数。当 CAN1 的 RX FIFO0 里至少有一帧 CAN 数据时，HAL 会调用这个函数。这个函数的作用是把 FIFO0 里的所有帧都读出来，并暂时丢弃。
@@ -545,9 +559,11 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
   //raw_command.cmd.data 本身是一个数组，raw_command.cmd.len 是数组的长度。
   //所以传给函数时会自动变成首元素地址
   if (!MotorControl_UpdateDShotCommands(raw_command.cmd.data,
-                                         raw_command.cmd.len))
+                                         raw_command.cmd.len,
+                                         transfer->timestamp_usec))
   {
     //映射失败时只增加错误计数，不覆盖上一条已经验证有效的命令。
+    //本阶段补充：为保证安全，motor_control 会把缓存命令全部置零并取消超时计时状态。
     g_raw_command_mapping_error_count++;
     return;
   }

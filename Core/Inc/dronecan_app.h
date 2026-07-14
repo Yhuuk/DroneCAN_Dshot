@@ -43,6 +43,8 @@ HAL_StatusTypeDef DroneCAN_App_Init(void);
  *
  * 本阶段补充：CAN RX 队列到 libcanard 的接收桥接已经接入；
  * TX、超时清理、油门 failsafe 仍然留到后续步骤。
+ * 本阶段补充：RawCommand 的 100 ms 油门超时保护已经接入；DroneCAN TX 和
+ * libcanard 传输状态清理仍留到后续步骤。
  */
 void DroneCAN_App_Poll(void);
 

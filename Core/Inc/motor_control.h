@@ -14,6 +14,9 @@ extern "C" {
 /* 当前硬件提供 DShot1..DShot8，共 8 路电机输出。 */
 #define MOTOR_CONTROL_DSHOT_OUTPUT_COUNT      8U
 
+/* 连续 100 ms 没有收到新的有效 RawCommand 时，全部电机命令进入停止状态。 */
+#define MOTOR_CONTROL_RAW_COMMAND_TIMEOUT_USEC 100000ULL
+
 /**
  * @brief 把一个 DroneCAN RawCommand 值映射成单向 DShot 命令。
  *
@@ -46,15 +49,30 @@ bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
  *
  * 该函数只保存 0 或 48..2047 的 DShot 命令值，尚不生成 16-bit 帧，
  * 也不会操作 TIM、DMA、CCR 或 GPIO。
+ * 本阶段补充：8 路命令现在会继续编码并保存为 8 个 16-bit DShot 帧；
+ * 仍然不会操作 TIM、DMA、CCR 或 GPIO。
  *
  * @param raw_commands      RawCommand 解码后的 cmd.data 数组。
  * @param raw_command_count RawCommand 解码后的 cmd.len。
+ * @param timestamp_usec    该条 RawCommand 的接收时间戳，单位为微秒。
  *
  * @retval true  前 8 路范围内的数据全部映射并保存成功。
  * @retval false 输入无效，8 路命令已安全地全部置为停止。
  */
 bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
-                                      uint8_t raw_command_count);
+                                      uint8_t raw_command_count,
+                                      uint64_t timestamp_usec);
+
+/**
+ * @brief 检查 RawCommand 是否已经超过 100 ms 没有更新。
+ *
+ * 该函数应由主循环周期调用。收到过有效 RawCommand 后，如果当前时间与最后一条
+ * 有效命令的时间差达到 100 ms，就把 8 路 DShot 命令全部置为 0。超时只处理一次，
+ * 后续必须收到新的有效 RawCommand，才会重新开始计时并允许命令更新。
+ *
+ * @param now_usec 当前单调递增时间戳，单位为微秒。
+ */
+void MotorControl_Poll(uint64_t now_usec);
 
 /**
  * @brief 读取一路当前保存的 DShot 命令，供后续帧编码步骤使用。
@@ -63,6 +81,17 @@ bool MotorControl_UpdateDShotCommands(const int16_t* raw_commands,
  * @return 对应的 DShot 命令；索引越界时安全返回 0（停止）。
  */
 uint16_t MotorControl_GetDShotCommand(uint8_t output_index);
+
+/**
+ * @brief 读取一路当前保存的 16-bit DShot 帧。
+ *
+ * 帧已经包含 11-bit 命令、遥测请求位和 4-bit 校验和。当前统一不请求遥测，
+ * 因此编码时传给 DShot_BuildFrame() 的 request_telemetry 固定为 false。
+ *
+ * @param output_index 输出索引，0..7 分别对应 DShot1..DShot8。
+ * @return 对应的完整 16-bit DShot 帧；索引越界时安全返回 0（停止帧）。
+ */
+uint16_t MotorControl_GetDShotFrame(uint8_t output_index);
 
 #ifdef __cplusplus
 }
