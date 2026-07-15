@@ -594,6 +594,11 @@
               <FileType>1</FileType>
               <FilePath>..\Core\Src\motor_control.c</FilePath>
             </File>
+            <File>
+              <FileName>dshot_output.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\dshot_output.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
