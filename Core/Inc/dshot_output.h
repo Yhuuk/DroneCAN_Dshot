@@ -86,6 +86,43 @@ HAL_StatusTypeDef DShotOutput_StartTimerDma(
  */
 HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
 
+/**
+ * @brief 使用TIM2 CH1～CH4发送一次DShot1～DShot4帧。
+ *
+ * 函数会读取motor_control当前保存的4路CCR数据，构建最终72-word DMA
+ * 缓冲区，然后安全使能4个PWM通道、启动TIM2 update DMA burst并启动计数器。
+ * DMA传输期间再次调用会返回HAL_BUSY，避免覆盖仍在使用的缓冲区。
+ *
+ * 本函数只发送一次18-slot波形，不负责固定周期重复发送，也没有在当前阶段
+ * 自动接入DroneCAN接收路径。后续TIM1会复用相同的内部四通道启动流程，
+ * 不需要修改本函数或现有DMA基础函数的参数。
+ *
+ * @return HAL_OK表示本次发送已经启动；其余返回HAL_BUSY或HAL_ERROR。
+ */
+HAL_StatusTypeDef DShotOutput_SendTim2Once(void);
+
+/**
+ * @brief 查询TIM2四通道DShot DMA是否仍在发送。
+ * @return true表示缓冲区正被DMA使用；false表示可以启动下一帧。
+ */
+bool DShotOutput_IsTim2Busy(void);
+
+/**
+ * @brief 处理HAL通知的TIM update DMA正常完成事件。
+ *
+ * 参数形式现在就保留为通用TIM句柄。当前只处理TIM2；后续接入TIM1时只需
+ * 在函数体内增加TIM1分支，不需要修改函数声明或HAL回调入口。
+ *
+ * @param htim 产生DMA完成事件的TIM句柄。
+ */
+void DShotOutput_HandleTimerPeriodElapsed(TIM_HandleTypeDef* htim);
+
+/**
+ * @brief 处理HAL通知的TIM DMA错误事件。
+ * @param htim 发生DMA错误的TIM句柄。
+ */
+void DShotOutput_HandleTimerError(TIM_HandleTypeDef* htim);
+
 #ifdef __cplusplus
 }
 #endif
