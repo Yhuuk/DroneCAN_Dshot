@@ -14,6 +14,7 @@
  */
 static uint32_t g_tim2_dma_buffer[DSHOT_OUTPUT_DMA_BUFFER_LENGTH];
 //表示TIM2 DMA是否正在使用缓冲区，发送期间不能重新修改g_tim2_dma_buffer，否则同一帧可能混入新旧数据。
+//true表示TIM2 DMA正在使用缓冲区，false表示TIM2 DMA空闲，可以重新修改g_tim2_dma_buffer。
 static volatile bool g_tim2_busy;
 
 /* 供Keil debugger观察TIM2发送完成和错误次数。 */
@@ -136,6 +137,11 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim)
     return HAL_ERROR;
   }
 
+  /*
+     1. 禁用DMA通道
+    2. 关闭TIM的Update DMA请求
+    3. 把HAL内部DMABurstState恢复成READY
+  */
   return HAL_TIM_DMABurst_WriteStop(htim, TIM_DMA_UPDATE);
 }
 

@@ -2,6 +2,7 @@
 
 #include "can.h"
 #include "canard.h"
+#include "dshot_output.h"
 #include "motor_control.h"
 
 #include "uavcan.equipment.esc.RawCommand.h"
@@ -110,6 +111,17 @@ static volatile uint32_t g_raw_command_received_count = 0U;
 static volatile uint32_t g_raw_command_decode_error_count = 0U;
 static volatile uint32_t g_raw_command_mapping_error_count = 0U;
 
+/*
+ * RawCommand解码和映射成功后只提出一次发送请求，真正启动TIM2 DMA仍放在
+ * DroneCAN_App_Poll()主循环上下文中。DMA忙时请求会保留到下一轮，不在
+ * libcanard回调中等待，也不会按照主循环的最高速度无条件重复发送。
+ */
+static volatile bool g_tim2_send_pending = false;
+
+/* 供Keil debugger观察TIM2发送启动是否成功。 */
+static volatile uint32_t g_tim2_send_start_count = 0U;
+static volatile uint32_t g_tim2_send_start_error_count = 0U;
+
 static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                         CanardRxTransfer* transfer);
 static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
@@ -199,6 +211,8 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
 void DroneCAN_App_Poll(void)
 {
   DroneCAN_RxQueueItem item;
+  HAL_StatusTypeDef dshot_send_status;
+  uint64_t now_usec;
 
   /*
    * 当前第一步还没有接入周期任务。
@@ -247,7 +261,35 @@ void DroneCAN_App_Poll(void)
    */
   //RX 队列处理完后调用 MotorControl_Poll()，然后比较的是 当前时间 - 新命令时间。只要收到新的有效命令，超时就会重新开始计数
   //这个是放在RX 队列处理完后，可以考虑一下这个处理的顺序问题
-  MotorControl_Poll(DroneCAN_GetTimestampUsec());
+  now_usec = DroneCAN_GetTimestampUsec();
+  //判断是否超时，若是大于100ms，就把所有的 DShot 命令置为停止。
+  MotorControl_Poll(now_usec);
+
+  /*
+   * 收到并成功映射RawCommand后，在主循环中使用TIM2发送一次DShot1～DShot4。
+   * 一次DMA发送约30 us；如果上一帧仍未完成，就保留pending请求，等完成
+   * 回调清除busy后由下一轮Poll重试。多个等待中的RawCommand会自然合并为
+   * 一次发送，发送时读取的是motor_control中最新的4路CCR数据。
+   */
+  if (g_tim2_send_pending && !DShotOutput_IsTim2Busy())
+  {
+    dshot_send_status = DShotOutput_SendTim2Once();
+
+    if (dshot_send_status == HAL_OK)
+    {
+      g_tim2_send_pending = false;
+      g_tim2_send_start_count++;
+    }
+    else if (dshot_send_status != HAL_BUSY)
+    {
+      /*
+       * 配置或HAL启动错误时不在每次主循环中连续重试。保留错误计数，收到
+       * 下一条有效RawCommand后会再次提出发送请求。
+       */
+      g_tim2_send_pending = false;
+      g_tim2_send_start_error_count++;
+    }
+  }
 }
 
 // HAL_CAN_RxFifo0MsgPendingCallback()是 HAL CAN driver 的一个回调函数。当 CAN1 的 RX FIFO0 里至少有一帧 CAN 数据时，HAL 会调用这个函数。这个函数的作用是把 FIFO0 里的所有帧都读出来，并暂时丢弃。
@@ -567,6 +609,9 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
     g_raw_command_mapping_error_count++;
     return;
   }
+
+  /* 映射和CCR构建全部成功，通知主循环发送最新的DShot1～DShot4。 */
+  g_tim2_send_pending = true;
 
   /*
    * 只有完整且解码成功的命令才会更新调试状态。received_count 最后增加，
