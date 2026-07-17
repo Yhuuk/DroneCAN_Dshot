@@ -7,6 +7,8 @@
  * 当前尚未接入帧编码和硬件输出，volatile 用于保证这些调试状态在 RAM 中
  * 保持可观察；后续可以在 Keil debugger 中直接查看每一路的命令值。
  * 本阶段补充：逻辑帧编码已经接入，但仍未接入 TIM、DMA 和 GPIO 硬件输出。
+ * 本阶段再次补充：TIM2固定周期发送已经接入；本模块仍只维护目标缓存，
+ * 具体DMA启动和发送时序继续由dshot_output与dronecan_app负责。
  */
 static volatile uint16_t g_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT];
 
@@ -46,6 +48,44 @@ static void MotorControl_StopAllDShotCommands(void)
       g_dshot_ccr_values[i][bit_index] = DSHOT_BIT_0_HIGH_TICKS;
     }
   }
+}
+
+void MotorControl_Init(void)
+{
+  /*
+   * 静态RAM上电后虽然默认为0，但CCR=0只会让引脚保持低电平，并不等于
+   * 发送一帧有效的DShot 0x0000。本函数显式构建停止帧对应的CCR缓存。
+   */
+  MotorControl_StopAllDShotCommands();
+  g_last_raw_command_timestamp_usec = 0ULL;
+  g_has_fresh_raw_command = false;
+  g_raw_command_timeout_count = 0U;
+}
+
+void MotorControl_ForceStop(void)
+{
+  MotorControl_StopAllDShotCommands();
+  g_has_fresh_raw_command = false;
+}
+
+bool MotorControl_HasFreshRawCommand(void)
+{
+  return g_has_fresh_raw_command;
+}
+
+bool MotorControl_AreAllDShotCommandsStopped(void)
+{
+  uint8_t i;
+
+  for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
+  {
+    if (g_dshot_commands[i] != 0U)
+    {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
@@ -228,8 +268,7 @@ void MotorControl_Poll(uint64_t now_usec)
   if ((now_usec - g_last_raw_command_timestamp_usec) >=
       MOTOR_CONTROL_RAW_COMMAND_TIMEOUT_USEC)
   {
-    MotorControl_StopAllDShotCommands();
-    g_has_fresh_raw_command = false;
+    MotorControl_ForceStop();
     g_raw_command_timeout_count++;
   }
 }

@@ -96,6 +96,8 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
  * 本函数只发送一次18-slot波形，不负责固定周期重复发送，也没有在当前阶段
  * 自动接入DroneCAN接收路径。后续TIM1会复用相同的内部四通道启动流程，
  * 不需要修改本函数或现有DMA基础函数的参数。
+ * 本阶段补充：固定周期仍不放进本底层函数，而是由DroneCAN_App_Poll()
+ * 每1 ms调用一次本函数。这样单帧DMA驱动与应用层发送策略保持独立。
  *
  * @return HAL_OK表示本次发送已经启动；其余返回HAL_BUSY或HAL_ERROR。
  */

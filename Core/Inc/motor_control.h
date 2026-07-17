@@ -18,6 +18,38 @@ extern "C" {
 #define MOTOR_CONTROL_RAW_COMMAND_TIMEOUT_USEC 100000ULL
 
 /**
+ * @brief 初始化电机控制缓存，使8路输出都处于有效的DShot停止状态。
+ *
+ * DShot停止帧虽然数值是0x0000，但每个逻辑0仍需要对应的PWM高电平时间，
+ * 所以不能只依赖RAM上电清零。本函数会同时准备命令、16-bit帧和CCR缓存，
+ * 应在开始周期发送DShot之前调用一次。
+ */
+void MotorControl_Init(void);
+
+/**
+ * @brief 立即把8路输出恢复为DShot停止帧，并取消当前命令的新鲜状态。
+ *
+ * 该接口供启动互锁、映射错误和上层故障保护共同使用。调用后固定周期发送器
+ * 仍可继续发送有效的0x0000停止帧，但必须收到新的有效RawCommand后，
+ * MotorControl_HasFreshRawCommand()才会重新返回true。
+ */
+void MotorControl_ForceStop(void);
+
+/**
+ * @brief 查询当前是否保存着一条尚未超时的有效RawCommand。
+ *
+ * @return true表示最近收到的命令有效且未超过100 ms；否则返回false。
+ */
+bool MotorControl_HasFreshRawCommand(void);
+
+/**
+ * @brief 查询当前8路DShot命令是否全部为停止命令0。
+ *
+ * @return true表示8路全部为0；任一路为普通油门命令时返回false。
+ */
+bool MotorControl_AreAllDShotCommandsStopped(void);
+
+/**
  * @brief 把一个 DroneCAN RawCommand 值映射成单向 DShot 命令。
  *
  * 当前采用安全的单向电调策略：

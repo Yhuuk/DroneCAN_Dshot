@@ -14,3 +14,6 @@ MDK-ARM/*.lst
 # Windows metadata
 Thumbs.db
 Desktop.ini
+
+# 调试文件
+EventRecorderStub.scvd
