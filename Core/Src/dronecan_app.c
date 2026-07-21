@@ -83,7 +83,7 @@
  * 上电、超时或错误后，必须连续收到2 s的零油门RawCommand，才允许非零
  * 命令进入实际输出。等待期间仍固定发送有效的DShot 0x0000停止帧。
  */
-#define DRONECAN_APP_DSHOT_ZERO_HOLD_USEC         2000000ULL
+#define DRONECAN_APP_DSHOT_ZERO_HOLD_USEC         1000000ULL
 
 //timestamp_usec 是一个 64 位的时间戳，单位是微秒。这个时间戳是 libcanard 用来计算传输超时的。
 //DroneCAN_RxQueueItem 是一个结构体，表示从 CAN 接收队列中取出的一帧数据。它包含了 CAN 帧的头信息、数据和时间戳。
@@ -137,6 +137,9 @@ typedef enum
  */
 static volatile DroneCAN_DShotState g_dshot_state =
     DRONECAN_DSHOT_STATE_WAIT_ZERO;
+
+//g_dshot_zero_hold_active是一个布尔变量，表示是否处于等待连续零油门命令的状态。
+//g_dshot_zero_hold_start_usec 是一个 64 位的时间戳，记录进入等待状态的起始时间，用于计算是否已经连续收到 2 秒的零命令。
 static bool g_dshot_zero_hold_active = false;
 static uint64_t g_dshot_zero_hold_start_usec = 0ULL;
 

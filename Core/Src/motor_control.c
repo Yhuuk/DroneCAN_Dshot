@@ -10,6 +10,7 @@
  * 本阶段再次补充：TIM2固定周期发送已经接入；本模块仍只维护目标缓存，
  * 具体DMA启动和发送时序继续由dshot_output与dronecan_app负责。
  */
+//g_dshot_commands是一个长度为8的数组，保存最近一次有效 RawCommand 映射得到的 8 路 DShot 命令，表示对应电调的 DShot 11bit 命令值。
 static volatile uint16_t g_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT];
 
 /* 保存与 g_dshot_commands 一一对应的 8 个完整 16-bit DShot 帧。 */
@@ -27,6 +28,8 @@ static uint32_t
  * g_has_fresh_raw_command 用来区分“从未收到命令/已经超时”和“正在等待超时”。
  */
 static uint64_t g_last_raw_command_timestamp_usec;
+
+//g_has_fresh_raw_command是一个布尔变量，表示是否有新的有效 RawCommand 命令已经接收并映
 static bool g_has_fresh_raw_command;
 
 /* 供 Keil debugger 观察 RawCommand 超时保护实际触发了多少次。 */

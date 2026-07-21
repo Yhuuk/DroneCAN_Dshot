@@ -79,7 +79,8 @@ HAL_StatusTypeDef DShotOutput_StartTimerDma(
  *
  * 正常模式DMA完成后，HAL仍要求调用WriteStop关闭TIM update DMA请求，并把
  * DMABurstState从busy恢复为ready，否则下一帧启动时会返回HAL_BUSY。
- * 本函数不会停止PWM通道；下一步会在DMA完成回调中统一处理DMA和PWM停止。
+ * 本函数不会停止PWM通道。固定周期输出启动后，PWM通道会始终保持使能，
+ * DMA完成回调只停止计数器和DMA，并以CCR=0主动保持帧间低电平。
  *
  * @param htim 定时器句柄。
  * @return HAL状态。
@@ -92,6 +93,8 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
  * 调用前必须已经执行MX_TIM2_Init()、MX_TIM7_Init()和MotorControl_Init()。
  * 本函数先把A/B两块DMA缓冲区都构建成完整停止帧，再启动TIM7更新中断；
  * 因此第一次周期中断不依赖主循环准备速度，也不会发送未初始化的数据。
+ * TIM2 CH1～CH4也在这里一次性使能，此后帧间通过CCR=0主动输出低电平，
+ * 不会在每帧完成后关闭通道并让DShot引脚进入高阻状态。
  *
  * 当前配置要求TIM7输入时钟48 MHz、PSC=47、ARR=1499。周期计算为：
  * 48 MHz / (47 + 1) = 1 MHz，(1499 + 1) / 1 MHz = 1.5 ms。
@@ -124,7 +127,8 @@ void DShotOutput_HandleTim7PeriodElapsed(void);
  * 本阶段补充：函数现在发送双缓冲中已经准备完成的active缓冲区，不再在
  * 函数内读取motor_control或构建72-word数据。数据准备由主循环中的
  * DShotOutput_PollTim2Preparation()完成，固定调用节拍由TIM7中断提供。
- * DMA传输期间再次调用会返回HAL_BUSY。
+ * TIM2四个PWM通道必须已经由DShotOutput_StartTim2Periodic()一次性使能；
+ * 本函数每次只启动DMA和TIM2计数器。DMA传输期间再次调用会返回HAL_BUSY。
  *
  * 本函数只发送一次18-slot波形，不负责固定周期重复发送，也没有在当前阶段
  * 自动接入DroneCAN接收路径。后续TIM1会复用相同的内部四通道启动流程，

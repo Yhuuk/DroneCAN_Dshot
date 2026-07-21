@@ -44,6 +44,12 @@ static volatile bool g_tim2_prepare_requested;
 static volatile bool g_tim2_prepare_in_progress;
 static volatile bool g_tim2_ready_buffer_available;
 static volatile bool g_tim2_periodic_started;
+/*
+ * TIM2的4个PWM通道只在固定周期输出启动时使能一次，之后始终保持使能。
+ * 帧间把CCR1～CCR4保持为0，使PA0～PA3由定时器主动输出低电平，不能让引脚悬空。
+ */
+//g_tim2_pwm_channels_started这个是开启定时器2的标志位，就是这个只开启一次，不重复开启
+static volatile bool g_tim2_pwm_channels_started;
 
 //表示TIM2 DMA是否正在发送，true期间不能再次启动同一个TIM2 DMA burst。
 static volatile bool g_tim2_busy;
@@ -246,6 +252,27 @@ HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
 
   __HAL_TIM_SET_COUNTER(&htim7, 0U);
   __HAL_TIM_CLEAR_FLAG(&htim7, TIM_FLAG_UPDATE);
+  DShotOutput_ExitCritical(previous_primask);
+
+  /*
+   * 在TIM7开始产生1.5 ms中断之前，一次性使能TIM2的CH1～CH4。
+   * 以后每帧只启停TIM2计数器和DMA，不再调用HAL_TIM_PWM_Stop()，因此帧间
+   * CCR=0时4个DShot引脚会被定时器持续主动拉低，而不是进入高阻悬空状态。
+   *
+   * 如果TIM7启动失败，PWM通道仍保持CCR=0的安全低电平。再次调用本函数时
+   * 通过g_tim2_pwm_channels_started跳过重复启动，避免HAL返回通道状态错误。
+   */
+  if (!g_tim2_pwm_channels_started)
+  {
+    status = DShotOutput_StartFourPwmChannelsLow(&htim2);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
+    g_tim2_pwm_channels_started = true;
+  }
+
+  previous_primask = DShotOutput_EnterCritical();
   g_tim2_periodic_started = true;
   DShotOutput_ExitCritical(previous_primask);
 
@@ -395,7 +422,7 @@ HAL_StatusTypeDef DShotOutput_SendTim2Once(void)
     return HAL_BUSY;
   }
 
-  if (!g_tim2_periodic_started)
+  if ((!g_tim2_periodic_started) || (!g_tim2_pwm_channels_started))
   {
     return HAL_ERROR;
   }
@@ -403,20 +430,8 @@ HAL_StatusTypeDef DShotOutput_SendTim2Once(void)
   dma_buffer = g_tim2_dma_buffers[g_tim2_active_buffer_index];
 
   /*
-   * 先以CCR=0启动CH1～CH4，使4个通道都进入HAL的BUSY状态并使能输出。
-   * 此时DMA尚未启动，因此即使TIM2短暂计数，引脚也只会保持低电平。
-   * helper随后会停止计数并把CNT重新归零，等待统一启动。
-   */
-  status = DShotOutput_StartFourPwmChannelsLow(&htim2);
-  if (status != HAL_OK)
-  {
-    DShotOutput_StopTimerGroup(&htim2);
-    return status;
-  }
-
-  /*
-   * 4个通道全部准备好之后再武装update DMA。这样启动TIM2计数器时，
-   * CH1～CH4从同一个CNT=0起点开始，不会有某一路提前进入数据周期。
+   * CH1～CH4已经在固定周期功能启动时一次性使能，并且当前CCR均为0。
+   * 这里只武装update DMA；随后从同一个CNT=0起点启动TIM2，4路波形保持同步。
    */
   status = DShotOutput_StartTimerDma(&htim2,
                                      dma_buffer,
@@ -457,7 +472,8 @@ void DShotOutput_HandleTimerPeriodElapsed(TIM_HandleTypeDef* htim)
 
   /*
    * 72个word已经全部传输。当前生效的是低电平slot，因此可以立即停止
-   * 计数器、DMA请求和4个PWM通道，并允许下一次发送重新使用缓冲区。
+   * 计数器和DMA请求，并允许下一次发送重新使用缓冲区。4个PWM通道继续
+   * 保持使能，让CCR=0在两帧之间持续主动输出低电平。
    */
   DShotOutput_StopTimerGroup(htim);
   g_tim2_send_complete_count++;
@@ -474,7 +490,7 @@ void DShotOutput_HandleTimerError(TIM_HandleTypeDef* htim)
     return;
   }
 
-  /* DMA异常时同样立即停止4路输出，不能让旧CCR继续循环产生波形。 */
+  /* DMA异常时立即停止计数和DMA，并用CCR=0让4路引脚继续保持安全低电平。 */
   DShotOutput_StopTimerGroup(htim);
   g_tim2_send_error_count++;
   g_tim2_busy = false;
@@ -585,8 +601,10 @@ static void DShotOutput_StopTimerGroup(TIM_HandleTypeDef* htim)
   }
 
   /*
-   * 将4个CCR的预装载值和活动值都恢复为0，再停止PWM通道。这样本帧结束后
-   * 引脚保持低电平，下次启动也不会短暂输出上一帧的占空比。
+   * 将4个CCR的预装载值和活动值都恢复为0。TIM2计数器虽然停止，但PWM通道
+   * 仍保持使能，所以PA0～PA3会由定时器主动输出低电平，而不是变成高阻状态。
+   * 这里故意不调用HAL_TIM_PWM_Stop()：该函数会清除CC1E～CC4E，使电调端的
+   * 偏置电路有机会把悬空信号线抬高，AM32可能因此误判为反相/双向DShot。
    */
   __HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, 0U);
   __HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_2, 0U);
@@ -596,11 +614,6 @@ static void DShotOutput_StopTimerGroup(TIM_HandleTypeDef* htim)
 
   //HAL_TIM_GenerateEvent 是产生Update事件，让CCR =0 真正生效
   (void)HAL_TIM_GenerateEvent(htim, TIM_EVENTSOURCE_UPDATE);
-
-  (void)HAL_TIM_PWM_Stop(htim, TIM_CHANNEL_1);
-  (void)HAL_TIM_PWM_Stop(htim, TIM_CHANNEL_2);
-  (void)HAL_TIM_PWM_Stop(htim, TIM_CHANNEL_3);
-  (void)HAL_TIM_PWM_Stop(htim, TIM_CHANNEL_4);
 
   __HAL_TIM_SET_COUNTER(htim, 0U);
   __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE);
