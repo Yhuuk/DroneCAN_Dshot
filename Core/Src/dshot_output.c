@@ -7,23 +7,69 @@
 
 /* TIM2固定驱动DShot1～DShot4，所以它使用第一组输出索引0。 */
 #define DSHOT_OUTPUT_TIM2_FIRST_OUTPUT_INDEX  0U
+#define DSHOT_OUTPUT_TIM2_DMA_BUFFER_COUNT     2U
 
 /*
- * DMA工作期间缓冲区内容不能被覆盖，因此缓冲区和busy状态都由本模块长期保存。
- * 后续接入TIM1时会增加第二个同尺寸缓冲区，不会改变现有发送接口的参数。
+ * TIM7的输入时钟是48 MHz。PSC=47后计数频率为1 MHz，每计数一次正好是1 us；
+ * ARR=1499表示从0计到1499，共1500次，因此更新中断周期严格为1500 us。
+ * 这里检查CubeMX生成的配置，避免以后误改TIM7参数后仍以为输出周期是1.5 ms。
  */
-static uint32_t g_tim2_dma_buffer[DSHOT_OUTPUT_DMA_BUFFER_LENGTH];
-//表示TIM2 DMA是否正在使用缓冲区，发送期间不能重新修改g_tim2_dma_buffer，否则同一帧可能混入新旧数据。
-//true表示TIM2 DMA正在使用缓冲区，false表示TIM2 DMA空闲，可以重新修改g_tim2_dma_buffer。
+#define DSHOT_OUTPUT_TIM7_EXPECTED_PRESCALER   47U
+#define DSHOT_OUTPUT_TIM7_EXPECTED_PERIOD      1499U
+
+/*
+ * TIM2采用A/B双缓冲，二维数组的第一维就是缓冲区编号：
+ *   g_tim2_dma_buffers[0]：A缓冲区，共72个word；
+ *   g_tim2_dma_buffers[1]：B缓冲区，共72个word。
+ *
+ * 双缓冲解决的问题：
+ *   1. TIM2 DMA发送时会连续读取当前active缓冲区，这块内存必须保持不变；
+ *   2. 主循环可以同时在另一块inactive缓冲区中准备最新4路DShot数据；
+ *   3. 主循环只有在72个word全部写完后，才把该缓冲区标记为ready；
+ *   4. TIM7中断只切换到已经ready的完整缓冲区，绝不会读取“写了一半”的数据。
+ *
+ * 例如本周期DMA正在读取A，主循环就在B中构建下一帧。B全部构建完成后发布ready；
+ * 下一个1.5 ms的TIM7中断切换到B发送，同时要求主循环重新准备A。之后A/B交替使用。
+ * 如果主循环来不及准备下一块，中断会重复发送上一块完整缓冲区，而不是发送损坏帧。
+ */
+static uint32_t
+    g_tim2_dma_buffers[DSHOT_OUTPUT_TIM2_DMA_BUFFER_COUNT]
+                      [DSHOT_OUTPUT_DMA_BUFFER_LENGTH];
+
+/* active是下一次DMA读取的缓冲区；prepare是主循环下一次需要写入的缓冲区。 */
+static volatile uint8_t g_tim2_active_buffer_index;
+static volatile uint8_t g_tim2_prepare_buffer_index;
+static volatile uint8_t g_tim2_ready_buffer_index;
+static volatile bool g_tim2_prepare_requested;
+static volatile bool g_tim2_prepare_in_progress;
+static volatile bool g_tim2_ready_buffer_available;
+static volatile bool g_tim2_periodic_started;
+
+//表示TIM2 DMA是否正在发送，true期间不能再次启动同一个TIM2 DMA burst。
 static volatile bool g_tim2_busy;
 
-/* 供Keil debugger观察TIM2发送完成和错误次数。 */
+/*
+ * 供Keil debugger观察固定周期发送和双缓冲是否正常。
+ * 正常运行时：
+ *   g_tim7_period_count、g_tim2_send_start_count和
+ *   g_tim2_send_complete_count应当以基本相同的速度增加；
+ *   error、busy_skip和prepare_not_ready通常应保持为0。
+ */
+static volatile uint32_t g_tim7_period_count;
+static volatile uint32_t g_tim2_send_start_count;
+static volatile uint32_t g_tim2_send_start_error_count;
+static volatile uint32_t g_tim2_send_busy_skip_count;
 static volatile uint32_t g_tim2_send_complete_count;
 static volatile uint32_t g_tim2_send_error_count;
+static volatile uint32_t g_tim2_prepare_count;
+static volatile uint32_t g_tim2_prepare_not_ready_count;
+static volatile uint32_t g_tim2_prepare_error_count;
 
 static HAL_StatusTypeDef DShotOutput_StartFourPwmChannelsLow(
     TIM_HandleTypeDef* htim);
 static void DShotOutput_StopTimerGroup(TIM_HandleTypeDef* htim);
+static uint32_t DShotOutput_EnterCritical(void);
+static void DShotOutput_ExitCritical(uint32_t previous_primask);
 
 //first_output_index是用来选择是哪个TIM的对应4个Dshot通道的
 //DShotOutput_BuildTimerDmaBuffer这个函数就是只能一次使用一组TIM的4个DShot通道，不能同时使用两组TIM的8个DShot通道，所以first_output_index只能是0或4，分别对应DShot1..4和DShot5..8
@@ -145,30 +191,216 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim)
   return HAL_TIM_DMABurst_WriteStop(htim, TIM_DMA_UPDATE);
 }
 
-HAL_StatusTypeDef DShotOutput_SendTim2Once(void)
+HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
+{
+  HAL_StatusTypeDef status;
+  uint32_t previous_primask;
+
+  if ((htim7.Instance != TIM7) ||
+      (htim7.Init.Prescaler != DSHOT_OUTPUT_TIM7_EXPECTED_PRESCALER) ||
+      (htim7.Init.Period != DSHOT_OUTPUT_TIM7_EXPECTED_PERIOD))
+  {
+    return HAL_ERROR;
+  }
+
+  /*
+   * 上电时motor_control中是停止命令。先把A、B都完整构建成停止帧，再启动TIM7，
+   * 确保第一次中断到来时已经有可直接发送的完整数据，不依赖主循环是否及时运行。
+   */
+  if ((!DShotOutput_BuildTimerDmaBuffer(
+          DSHOT_OUTPUT_TIM2_FIRST_OUTPUT_INDEX,
+          g_tim2_dma_buffers[0],
+          DSHOT_OUTPUT_DMA_BUFFER_LENGTH)) ||
+      (!DShotOutput_BuildTimerDmaBuffer(
+          DSHOT_OUTPUT_TIM2_FIRST_OUTPUT_INDEX,
+          g_tim2_dma_buffers[1],
+          DSHOT_OUTPUT_DMA_BUFFER_LENGTH)))
+  {
+    return HAL_ERROR;
+  }
+
+  previous_primask = DShotOutput_EnterCritical();
+  if (g_tim2_periodic_started)
+  {
+    DShotOutput_ExitCritical(previous_primask);
+    return HAL_BUSY;
+  }
+
+  g_tim2_active_buffer_index = 0U;
+  g_tim2_prepare_buffer_index = 0U;
+  g_tim2_ready_buffer_index = 1U;
+  g_tim2_prepare_requested = false;
+  g_tim2_prepare_in_progress = false;
+  g_tim2_ready_buffer_available = true;
+  g_tim2_busy = false;
+
+  g_tim7_period_count = 0U;
+  g_tim2_send_start_count = 0U;
+  g_tim2_send_start_error_count = 0U;
+  g_tim2_send_busy_skip_count = 0U;
+  g_tim2_send_complete_count = 0U;
+  g_tim2_send_error_count = 0U;
+  g_tim2_prepare_count = 0U;
+  g_tim2_prepare_not_ready_count = 0U;
+  g_tim2_prepare_error_count = 0U;
+
+  __HAL_TIM_SET_COUNTER(&htim7, 0U);
+  __HAL_TIM_CLEAR_FLAG(&htim7, TIM_FLAG_UPDATE);
+  g_tim2_periodic_started = true;
+  DShotOutput_ExitCritical(previous_primask);
+
+  status = HAL_TIM_Base_Start_IT(&htim7);
+  if (status != HAL_OK)
+  {
+    previous_primask = DShotOutput_EnterCritical();
+    g_tim2_periodic_started = false;
+    DShotOutput_ExitCritical(previous_primask);
+  }
+
+  return status;
+}
+
+void DShotOutput_PollTim2Preparation(void)
+{
+  uint8_t buffer_index;
+  bool build_succeeded;
+  uint32_t previous_primask;
+
+  /*
+   * TIM7中断只发布一个轻量的prepare_requested请求。主循环在这里接走请求，
+   * 避免在中断里遍历并构建72个CCR值，让1.5 ms节拍中断尽量短且稳定。
+   */
+  previous_primask = DShotOutput_EnterCritical();
+  if ((!g_tim2_periodic_started) ||
+      (!g_tim2_prepare_requested) ||
+      g_tim2_prepare_in_progress)
+  {
+    DShotOutput_ExitCritical(previous_primask);
+    return;
+  }
+
+  buffer_index = g_tim2_prepare_buffer_index;
+  g_tim2_prepare_requested = false;
+  g_tim2_prepare_in_progress = true;
+  DShotOutput_ExitCritical(previous_primask);
+
+  /*
+   * 构建过程放在临界区之外，CAN和TIM中断仍可正常响应。此时buffer_index必定
+   * 不是DMA正在读取的active缓冲区，所以写入不会破坏当前正在发送的DShot帧。
+   */
+  build_succeeded = DShotOutput_BuildTimerDmaBuffer(
+      DSHOT_OUTPUT_TIM2_FIRST_OUTPUT_INDEX,
+      g_tim2_dma_buffers[buffer_index],
+      DSHOT_OUTPUT_DMA_BUFFER_LENGTH);
+
+  previous_primask = DShotOutput_EnterCritical();
+  if (build_succeeded)
+  {
+    /*
+     * __DMB()保证72个word的内存写入先完成，然后才发布ready标志。
+     * TIM7中断一旦看到ready=true，就能确定整块缓冲区已经完整可读。
+     */
+    __DMB();
+    g_tim2_ready_buffer_index = buffer_index;
+    g_tim2_ready_buffer_available = true;
+    g_tim2_prepare_count++;
+  }
+  else
+  {
+    /* 构建失败时保留请求，下一轮主循环重试，不发布不完整缓冲区。 */
+    g_tim2_prepare_requested = true;
+    g_tim2_prepare_error_count++;
+  }
+  g_tim2_prepare_in_progress = false;
+  DShotOutput_ExitCritical(previous_primask);
+}
+
+void DShotOutput_HandleTim7PeriodElapsed(void)
 {
   HAL_StatusTypeDef status;
 
+  if (!g_tim2_periodic_started)
+  {
+    return;
+  }
+
+  g_tim7_period_count++;
+
   /*
-   * g_tim2_dma_buffer正在被DMA读取时不能重新构建，否则同一帧中可能混入
-   * 新旧两组CCR值。busy一直保持到DMA完成回调完成清理。
+   * 一帧DShot600约30 us，远小于1.5 ms。若此时仍busy，说明上一次DMA没有
+   * 正常结束或调试器长时间暂停，本周期不能覆盖DMA状态，只记录并跳过。
+   */
+  if (g_tim2_busy)
+  {
+    g_tim2_send_busy_skip_count++;
+    return;
+  }
+
+  if (g_tim2_ready_buffer_available)
+  {
+    /*
+     * 主循环通过__DMB()后才置ready。这里先确认写入可见，再把完整缓冲区
+     * 切换成active；从此刻到DMA完成，主循环不会再修改这块内存。
+     */
+    __DMB();
+    g_tim2_active_buffer_index = g_tim2_ready_buffer_index;
+    g_tim2_ready_buffer_available = false;
+  }
+  else
+  {
+    /*
+     * 下一块尚未准备完成时继续使用上一块active缓冲区。重复一帧旧命令比
+     * 发送一块只写了一半的缓冲区安全，且该异常可由此计数器直接观察。
+     */
+    g_tim2_prepare_not_ready_count++;
+  }
+
+  /*
+   * active的另一块就是下一次inactive准备区。只有没有待处理请求且主循环
+   * 没在构建时才发布新请求，避免重复覆盖同一个准备任务。
+   */
+  if ((!g_tim2_prepare_requested) && (!g_tim2_prepare_in_progress))
+  {
+    g_tim2_prepare_buffer_index =
+        (uint8_t)(g_tim2_active_buffer_index ^ 1U);
+    g_tim2_prepare_requested = true;
+  }
+
+  status = DShotOutput_SendTim2Once();
+  if (status == HAL_OK)
+  {
+    g_tim2_send_start_count++;
+  }
+  else if (status == HAL_BUSY)
+  {
+    g_tim2_send_busy_skip_count++;
+  }
+  else
+  {
+    g_tim2_send_start_error_count++;
+  }
+}
+
+HAL_StatusTypeDef DShotOutput_SendTim2Once(void)
+{
+  HAL_StatusTypeDef status;
+  const uint32_t* dma_buffer;
+
+  /*
+   * 本函数只发送双缓冲中当前active的完整数据，不再现场读取motor_control。
+   * active缓冲区由TIM7中断选择，并且在DMA完成前不会被主循环修改。
    */
   if (g_tim2_busy)
   {
     return HAL_BUSY;
   }
 
-  /*
-   * 72个word的DMA缓冲区由当前motor_control保存的4路CCR值构建。每路CCR值
-   * 对应一个DShot通道的16个bit,后面2个slot全部写0。
-   */
-  if (!DShotOutput_BuildTimerDmaBuffer(
-          DSHOT_OUTPUT_TIM2_FIRST_OUTPUT_INDEX,
-          g_tim2_dma_buffer,
-          DSHOT_OUTPUT_DMA_BUFFER_LENGTH))
+  if (!g_tim2_periodic_started)
   {
     return HAL_ERROR;
   }
+
+  dma_buffer = g_tim2_dma_buffers[g_tim2_active_buffer_index];
 
   /*
    * 先以CCR=0启动CH1～CH4，使4个通道都进入HAL的BUSY状态并使能输出。
@@ -187,7 +419,7 @@ HAL_StatusTypeDef DShotOutput_SendTim2Once(void)
    * CH1～CH4从同一个CNT=0起点开始，不会有某一路提前进入数据周期。
    */
   status = DShotOutput_StartTimerDma(&htim2,
-                                     g_tim2_dma_buffer,
+                                     dma_buffer,
                                      DSHOT_OUTPUT_DMA_BUFFER_LENGTH);
   if (status != HAL_OK)
   {
@@ -374,12 +606,39 @@ static void DShotOutput_StopTimerGroup(TIM_HandleTypeDef* htim)
   __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE);
 }
 
+static uint32_t DShotOutput_EnterCritical(void)
+{
+  uint32_t previous_primask = __get_PRIMASK();
+
+  __disable_irq();
+  return previous_primask;
+}
+
+static void DShotOutput_ExitCritical(uint32_t previous_primask)
+{
+  /*
+   * 如果调用前中断本来就是关闭的，这里不能擅自打开；只有原来允许中断时
+   * 才恢复使能。临界区只保护几个双缓冲状态变量，不包含72-word构建过程。
+   */
+  if (previous_primask == 0U)
+  {
+    __enable_irq();
+  }
+}
+
 /*
  * update DMA正常完成时，HAL内部最终会调用这个官方弱回调。这里只做分发，
- * 以后增加TIM1时继续复用同一个入口。
+ * TIM7基本定时中断和TIM2 DMA完成最终都会进入这个同名官方回调，所以必须
+ * 先根据句柄区分来源。以后增加TIM1时也继续复用同一个入口。
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
 {
+  if (htim == &htim7)
+  {
+    DShotOutput_HandleTim7PeriodElapsed();
+    return;
+  }
+
   DShotOutput_HandleTimerPeriodElapsed(htim);
 }
 

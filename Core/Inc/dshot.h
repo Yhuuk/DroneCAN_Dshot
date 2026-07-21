@@ -25,8 +25,8 @@ extern "C" {
  * 由 80 个定时器计数组成。逻辑 0 的高电平约占 37.5%，逻辑 1 约占 75%。
  */
 #define DSHOT_TIMER_TICKS_PER_BIT         80U
-#define DSHOT_BIT_0_HIGH_TICKS            30U
-#define DSHOT_BIT_1_HIGH_TICKS            60U
+#define DSHOT_BIT_0_HIGH_TICKS            28U
+#define DSHOT_BIT_1_HIGH_TICKS            56U
 
 /**
  * @brief 把一个 11-bit DShot 命令编码成完整的 16-bit DShot 帧。

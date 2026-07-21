@@ -26,8 +26,9 @@ extern "C" {
  * DShot 输出仍然没有接入。
  * 本阶段再次补充：RawCommand 的前 8 路已映射并保存为 DShot 命令；
  * 16-bit DShot 帧、定时器/DMA 波形和实际输出仍未接入。
- * 本阶段再次补充：TIM2现已由主循环固定以1 kHz发送DShot1..DShot4。
- * 上电后先持续发送停止帧，并要求连续收到500 ms零命令后才允许输出油门。
+ * 本阶段再次补充：TIM7现以1.5 ms硬件节拍触发TIM2发送DShot1..DShot4，
+ * 主循环使用A/B双缓冲准备下一帧。上电后先持续发送停止帧，并要求连续收到
+ * 2 s零命令后才允许输出油门。
  *
  * @retval HAL_OK    DroneCAN 基础层已准备好，可以接收 CAN 中断。
  * @retval HAL_ERROR 启动流程中的某一步失败。
@@ -47,8 +48,8 @@ HAL_StatusTypeDef DroneCAN_App_Init(void);
  * TX、超时清理、油门 failsafe 仍然留到后续步骤。
  * 本阶段补充：RawCommand 的 100 ms 油门超时保护已经接入；DroneCAN TX 和
  * libcanard 传输状态清理仍留到后续步骤。
- * 本阶段再次补充：本函数还负责DShot的1 kHz固定周期调度、500 ms零命令
- * 启动互锁和超时后重新进入等待零命令状态。
+ * 本阶段再次补充：本函数负责准备DShot双缓冲、2 s零命令启动互锁和超时后
+ * 重新进入等待零命令状态；严格1.5 ms发送节拍由TIM7中断独立提供。
  */
 void DroneCAN_App_Poll(void);
 
