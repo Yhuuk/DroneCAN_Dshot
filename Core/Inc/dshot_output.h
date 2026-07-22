@@ -88,13 +88,13 @@ HAL_StatusTypeDef DShotOutput_StartTimerDma(
 HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
 
 /**
- * @brief 启动由TIM7提供1.5 ms硬件节拍的TIM2周期发送。
+ * @brief 启动由TIM7提供1.5 ms硬件节拍的DShot公共调度器。
  *
  * 调用前必须已经执行MX_TIM2_Init()、MX_TIM7_Init()和MotorControl_Init()。
- * 本函数先把A/B两块DMA缓冲区都构建成完整停止帧，再启动TIM7更新中断；
- * 因此第一次周期中断不依赖主循环准备速度，也不会发送未初始化的数据。
- * TIM2 CH1～CH4也在这里一次性使能，此后帧间通过CCR=0主动输出低电平，
- * 不会在每帧完成后关闭通道并让DShot引脚进入高阻状态。
+ * 内部已经采用“TIM1/TIM2两个私有上下文＋一个公共调度器”。本函数会先为
+ * 所有已启用上下文构建A/B两块完整停止帧，再启动TIM7更新中断。
+ * 当前仅TIM2上下文启用，TIM1上下文已经预留但不会启动或改变DShot5～DShot8。
+ * TIM2 CH1～CH4在这里一次性使能，此后帧间通过CCR=0主动输出低电平。
  *
  * 当前配置要求TIM7输入时钟48 MHz、PSC=47、ARR=1499。周期计算为：
  * 48 MHz / (47 + 1) = 1 MHz，(1499 + 1) / 1 MHz = 1.5 ms。
@@ -105,10 +105,11 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
 HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void);
 
 /**
- * @brief 在主循环中准备TIM2下一周期使用的双缓冲数据。
+ * @brief 在主循环中准备下一周期使用的整组双缓冲数据。
  *
- * TIM7中断只提出准备请求，本函数在未被DMA使用的另一块缓冲区中构建72个
- * CCR word。全部写完后才发布ready标志，所以中断不会读到半成品。
+ * TIM7中断只提出准备请求，本函数为所有已启用定时器构建相同A/B编号的缓冲。
+ * 当前是一块TIM2的72个CCR word；以后启用TIM1后会在同一次请求中构建两块。
+ * 所有缓冲全部写完后才发布ready标志，所以中断不会读到半组新、半组旧数据。
  * 本函数不等待、不启动DMA；没有准备请求时会立即返回。
  */
 void DShotOutput_PollTim2Preparation(void);
@@ -117,40 +118,17 @@ void DShotOutput_PollTim2Preparation(void);
  * @brief 处理一个TIM7的1.5 ms更新节拍。
  *
  * 本函数在TIM7中断上下文运行：选择已经准备完成的双缓冲区、提出下一块
- * 缓冲区的准备请求，并启动一次TIM2四通道DShot DMA发送。
+ * 缓冲区的准备请求，并通过公共发送器启动所有已启用定时器的DShot DMA。
+ * 当前只启动TIM2；启用TIM1上下文后，此函数无需修改即可调度两组输出。
  */
 void DShotOutput_HandleTim7PeriodElapsed(void);
 
-/**
- * @brief 使用TIM2 CH1～CH4发送一次DShot1～DShot4帧。
- *
- * 本阶段补充：函数现在发送双缓冲中已经准备完成的active缓冲区，不再在
- * 函数内读取motor_control或构建72-word数据。数据准备由主循环中的
- * DShotOutput_PollTim2Preparation()完成，固定调用节拍由TIM7中断提供。
- * TIM2四个PWM通道必须已经由DShotOutput_StartTim2Periodic()一次性使能；
- * 本函数每次只启动DMA和TIM2计数器。DMA传输期间再次调用会返回HAL_BUSY。
- *
- * 本函数只发送一次18-slot波形，不负责固定周期重复发送，也没有在当前阶段
- * 自动接入DroneCAN接收路径。后续TIM1会复用相同的内部四通道启动流程，
- * 不需要修改本函数或现有DMA基础函数的参数。
- * 这个单帧接口继续保留，TIM7固定周期处理函数会调用它；以后TIM1也可以
- * 复用相同的单帧发送结构，不需要修改这里的参数。
- *
- * @return HAL_OK表示本次发送已经启动；其余返回HAL_BUSY或HAL_ERROR。
- */
-HAL_StatusTypeDef DShotOutput_SendTim2Once(void);
-
-/**
- * @brief 查询TIM2四通道DShot DMA是否仍在发送。
- * @return true表示缓冲区正被DMA使用；false表示可以启动下一帧。
- */
-bool DShotOutput_IsTim2Busy(void);
 
 /**
  * @brief 处理HAL通知的TIM update DMA正常完成事件。
  *
- * 参数形式现在就保留为通用TIM句柄。当前只处理TIM2；后续接入TIM1时只需
- * 在函数体内增加TIM1分支，不需要修改函数声明或HAL回调入口。
+ * 函数会根据句柄查找TIM1或TIM2上下文，并只清理、计数对应的那一组。
+ * 当前TIM1调度关闭，但它的完成处理路径已经具备，不再需要增加TIM1分支。
  *
  * @param htim 产生DMA完成事件的TIM句柄。
  */

@@ -24,6 +24,12 @@ extern "C" {
  * 当前 TIM1/TIM2 时钟为 48 MHz，PSC=0、ARR=79，因此一个 DShot600 bit
  * 由 80 个定时器计数组成。逻辑 0 的高电平约占 37.5%，逻辑 1 约占 75%。
  */
+/*
+ * 当前 IM2 时钟为 48 MHz，PSC=0、ARR=83，因此一个 DShot600 bit
+ * 由 84 个定时器计数组成。逻辑 0 的高电平约占 33.3%，逻辑 1 约占 66.6%。
+ * 
+ * DSHOT_TIMER_TICKS_PER_BIT并没有实际使用
+ */
 #define DSHOT_TIMER_TICKS_PER_BIT         80U
 #define DSHOT_BIT_0_HIGH_TICKS            28U
 #define DSHOT_BIT_1_HIGH_TICKS            56U
