@@ -17,18 +17,9 @@ extern "C" {
  *   3. 启动 CAN1；
  *   4. 打开 RX FIFO0 接收通知。
  *
- * 当前第一步只把 DroneCAN 基础接收环境搭起来，暂时不启动 DShot 输出，
- * 也暂时不解析 DroneCAN 消息。后续会在接收链路稳定后逐步接上。
- *
- * 本阶段补充：CAN 帧已经会被转交给 libcanard 解析基础 transfer 信息；
- * RawCommand 解码和 DShot 输出仍然没有接入。
- * 本阶段再次补充：RawCommand 已能被接受、解码并暂存供调试观察；
- * DShot 输出仍然没有接入。
- * 本阶段再次补充：RawCommand 的前 8 路已映射并保存为 DShot 命令；
- * 16-bit DShot 帧、定时器/DMA 波形和实际输出仍未接入。
- * 本阶段再次补充：TIM7现以1.5 ms硬件节拍触发TIM2发送DShot1..DShot4，
+ * 本阶段再次补充：TIM7现以1.5 ms硬件节拍触发TIM2/TIM1发送DShot1..DShot8，
  * 主循环使用A/B双缓冲准备下一帧。上电后先持续发送停止帧，并要求连续收到
- * 2 s零命令后才允许输出油门。
+ * 1 s零命令后才允许输出油门。
  *
  * @retval HAL_OK    DroneCAN 基础层已准备好，可以接收 CAN 中断。
  * @retval HAL_ERROR 启动流程中的某一步失败。
@@ -44,11 +35,11 @@ HAL_StatusTypeDef DroneCAN_App_Init(void);
  *   - 清理超时的 DroneCAN 传输状态；
  *   - 执行油门超时和 failsafe 检查。
  *
- * 本阶段补充：CAN RX 队列到 libcanard 的接收桥接已经接入；
+ * CAN RX 队列到 libcanard 的接收桥接已经接入；
  * TX、超时清理、油门 failsafe 仍然留到后续步骤。
- * 本阶段补充：RawCommand 的 100 ms 油门超时保护已经接入；DroneCAN TX 和
+ * RawCommand 的 100 ms 油门超时保护已经接入；DroneCAN TX 和
  * libcanard 传输状态清理仍留到后续步骤。
- * 本阶段再次补充：本函数负责准备DShot双缓冲、2 s零命令启动互锁和超时后
+ * 本函数负责准备DShot双缓冲、1 s零命令启动互锁和超时后
  * 重新进入等待零命令状态；严格1.5 ms发送节拍由TIM7中断独立提供。
  */
 void DroneCAN_App_Poll(void);

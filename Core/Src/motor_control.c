@@ -91,7 +91,7 @@ bool MotorControl_AreAllDShotCommandsStopped(void)
   return true;
 }
 
-bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
+static bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
                                        uint16_t* out_dshot_command)
 {
     //raw_positive_offset是原始命令值减去 RawCommand 正值区间的起点 1，表示当前命令在正值区间中的偏移量。
@@ -274,26 +274,6 @@ void MotorControl_Poll(uint64_t now_usec)
     MotorControl_ForceStop();
     g_raw_command_timeout_count++;
   }
-}
-
-uint16_t MotorControl_GetDShotCommand(uint8_t output_index)
-{
-  if (output_index >= MOTOR_CONTROL_DSHOT_OUTPUT_COUNT)
-  {
-    return 0U;
-  }
-
-  return g_dshot_commands[output_index];
-}
-
-uint16_t MotorControl_GetDShotFrame(uint8_t output_index)
-{
-  if (output_index >= MOTOR_CONTROL_DSHOT_OUTPUT_COUNT)
-  {
-    return 0U;
-  }
-
-  return g_dshot_frames[output_index];
 }
 
 uint32_t MotorControl_GetDShotCcrValue(uint8_t output_index,

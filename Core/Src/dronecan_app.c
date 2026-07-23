@@ -29,7 +29,7 @@
  * 本阶段再次补充：RawCommand 的前 8 路已经会被映射并保存为 DShot 命令，
  * 但仍未生成 16-bit DShot 帧，也没有操作定时器或实际输出引脚。
  * 本阶段再次补充：DShot帧、CCR和TIM2 DMA发送均已接入；TIM7现在每1.5 ms
- * 触发一次TIM2发送，并使用2 s连续零命令启动互锁保护实际油门输出。
+ * 触发一次TIM2和TIM1发送，并使用1 s连续零命令启动互锁保护实际油门输出。
  */
 
  /*
@@ -127,7 +127,7 @@ typedef enum
 } DroneCAN_DShotState;
 
 /*
- * RawCommand解码和映射成功后只提出一次发送请求，真正启动TIM2 DMA仍放在
+ * RawCommand解码和映射成功后只提出一次发送请求，真正启动TIM2 DMA和TIM1 DMA仍放在
  * DroneCAN_App_Poll()主循环上下文中。DMA忙时请求会保留到下一轮，不在
  * libcanard回调中等待，也不会按照主循环的最高速度无条件重复发送。
  * 本阶段补充：一次请求发送机制已替换为TIM7固定1.5 ms调度。RawCommand
@@ -178,7 +178,7 @@ static void DroneCAN_ResetDShotZeroHold(void);
 static void DroneCAN_EnterDShotWaitZeroState(void);
 static void DroneCAN_HandleMappedRawCommand(uint64_t timestamp_usec);
 static void DroneCAN_PollDShotState(uint64_t now_usec);
-static void DroneCAN_PollDShotSend(uint64_t now_usec);
+static void DroneCAN_PollDShotSend(void);
 
 
 /**
@@ -195,7 +195,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
 {
   /*
    * 在第一次启动DMA之前先构建8路有效停止帧。后面的周期启动函数还会把
-   * TIM2的A/B两块DMA缓冲区都准备为停止帧，因此TIM7第一个1.5 ms节拍
+   * TIM2和TIM1的A/B两块DMA缓冲区都准备为停止帧，因此TIM7第一个1.5 ms节拍
    * 到来时就能直接发送完整的0x0000帧。
    */
   MotorControl_Init();
@@ -250,7 +250,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
    * stm32l4xx_it.c中，它调用HAL_TIM_IRQHandler(&htim7)，随后HAL再调用
    * dshot_output.c底部实现的HAL_TIM_PeriodElapsedCallback()。
    */
-  if (DShotOutput_StartTim2Periodic() != HAL_OK)
+  if (DShotOutput_StartPeriodic() != HAL_OK)
   {
     return HAL_ERROR;
   }
@@ -315,17 +315,15 @@ void DroneCAN_App_Poll(void)
   MotorControl_Poll(now_usec);
 
   /*
-   * 收到并成功映射RawCommand后，在主循环中使用TIM2发送一次DShot1～DShot4。
-   * 一次DMA发送约30 us；如果上一帧仍未完成，就保留pending请求，等完成
-   * 回调清除busy后由下一轮Poll重试。多个等待中的RawCommand会自然合并为
-   * 一次发送，发送时读取的是motor_control中最新的4路CCR数据。
-   * 本阶段补充：现在不再由pending触发发送。下面先更新2 s启动/超时状态机，
+   * 收到并成功映射RawCommand后，在主循环中使用TIM2发送一次DShot1～DShot4和
+   * TIM1发送一次DShot5～DShot8。一次DMA发送约30 us；
+   * 本阶段补充：现在不再由pending触发发送。下面先更新1 s启动/超时状态机，
    * 再准备TIM7下一个1.5 ms节拍要使用的inactive双缓冲区；实际发送只由
    * TIM7中断触发。因此无命令时也会持续发停止帧，RawCommand到达时间抖动
    * 不会直接变成DShot帧间隔抖动。
    */
   DroneCAN_PollDShotState(now_usec);
-  DroneCAN_PollDShotSend(now_usec);
+  DroneCAN_PollDShotSend();
 }
 
 // HAL_CAN_RxFifo0MsgPendingCallback()是 HAL CAN driver 的一个回调函数。当 CAN1 的 RX FIFO0 里至少有一帧 CAN 数据时，HAL 会调用这个函数。这个函数的作用是把 FIFO0 里的所有帧都读出来，并暂时丢弃。
@@ -591,17 +589,13 @@ static void DroneCAN_PollDShotState(uint64_t now_usec)
   }
 }
 
-static void DroneCAN_PollDShotSend(uint64_t now_usec)
+static void DroneCAN_PollDShotSend(void)
 {
   /*
-   * 参数保留为当前微秒时间戳，便于以后增加“准备耗时/命令生效延迟”统计，
-   * 当前双缓冲准备本身不需要时间值，因此显式标记暂未使用。
-   *
-   * 这里不再判断1.5 ms是否到达，也不直接启动TIM2。TIM7硬件负责严格节拍，
+   * 这里不再判断1.5 ms是否到达，也不直接启动TIM2/TIM1。TIM7硬件负责严格节拍，
    * 主循环只响应中断提出的请求，在inactive缓冲区中准备下一帧。
    */
-  (void)now_usec;
-  DShotOutput_PollTim2Preparation();
+  DShotOutput_PollPreparation();
 }
 
 static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
@@ -752,11 +746,11 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
     return;
   }
 
-  /* 映射和CCR构建全部成功，通知主循环发送最新的DShot1～DShot4。 */
+  /* 映射和CCR构建全部成功，通知主循环发送最新的DShot1～DShot8。 */
   /*
    * 本阶段补充：发送已经改成TIM7固定1.5 ms，这里不再提出单次pending请求。
    * 回调只更新启动状态：WAIT_ZERO期间非零命令会被强制替换成停止帧；
-   * 连续零命令满2 s进入RUNNING后，最新映射值才可由调度器输出。
+   * 连续零命令满1 s进入RUNNING后，最新映射值才可由调度器输出。
    */
   DroneCAN_HandleMappedRawCommand(transfer->timestamp_usec);
 

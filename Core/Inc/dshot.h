@@ -12,6 +12,8 @@ extern "C" {
  * DShot 的命令字段宽度是 11 bit，因此合法范围是 0..2047。
  * 其中 0 表示停止，1..47 是协议保留的特殊命令，48..2047 才是普通油门值。
  * 本模块只负责按协议编码，不决定 RawCommand 应该映射成哪个 DShot 命令。
+ * 
+ * DSHOT_SPECIAL_COMMAND_MAX_VALUE 实际并未使用，只是告诉Dshot的油门特殊值的最大值是47，48才是最小的油门值
  */
 #define DSHOT_COMMAND_MAX_VALUE          2047U
 #define DSHOT_SPECIAL_COMMAND_MAX_VALUE  47U
@@ -28,9 +30,9 @@ extern "C" {
  * 当前 IM2 时钟为 48 MHz，PSC=0、ARR=83，因此一个 DShot600 bit
  * 由 84 个定时器计数组成。逻辑 0 的高电平约占 33.3%，逻辑 1 约占 66.6%。
  * 
- * DSHOT_TIMER_TICKS_PER_BIT并没有实际使用
+ * DSHOT_TIMER_TICKS_PER_BIT并没有实际使用，它只是表达一种关系，和28/56的比例关系。分别是占了总计数的1/3和2/3。28+56=84
  */
-#define DSHOT_TIMER_TICKS_PER_BIT         80U
+#define DSHOT_TIMER_TICKS_PER_BIT         84U
 #define DSHOT_BIT_0_HIGH_TICKS            28U
 #define DSHOT_BIT_1_HIGH_TICKS            56U
 

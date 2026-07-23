@@ -20,23 +20,8 @@
 #define DSHOT_OUTPUT_TIM7_EXPECTED_PERIOD      1499U
 
 /*
- * 本次整理只改变内部状态的组织方式，不改变外部函数声明和当前TIM2输出行为。
+ * 统一使用结构体上下文分别描述两个个TIM的状态。
  * 旧变量与新位置的对应关系如下，旧的独立全局标志位已经被结构体成员替换：
- *
- * g_tim2_dma_buffers[]             -> g_tim2_output.dma_buffers[]
- * g_tim2_pwm_channels_started      -> g_tim2_output.pwm_channels_started
- * g_tim2_busy                      -> g_tim2_output.busy
- * g_tim2_send_*_count              -> g_tim2_output.send_*_count
- *
- * g_tim2_active_buffer_index       -> g_dshot_scheduler.active_buffer_index
- * g_tim2_prepare_buffer_index      -> g_dshot_scheduler.prepare_buffer_index
- * g_tim2_ready_buffer_index        -> g_dshot_scheduler.ready_buffer_index
- * g_tim2_prepare_requested         -> g_dshot_scheduler.prepare_requested
- * g_tim2_prepare_in_progress       -> g_dshot_scheduler.prepare_in_progress
- * g_tim2_ready_buffer_available    -> g_dshot_scheduler.ready_buffer_available
- * g_tim2_periodic_started          -> g_dshot_scheduler.periodic_started
- * g_tim7_period_count              -> g_dshot_scheduler.period_count
- * g_tim2_prepare_*_count           -> g_dshot_scheduler.prepare_*_count
  *
  * 第一组状态必须每个TIM各有一份；第二组状态必须由TIM1/TIM2共同使用。
  * 这样既能分别诊断两个DMA，又能保证未来8路输出在同一时刻切换同一批命令。
@@ -72,8 +57,8 @@ typedef struct
                       [DSHOT_OUTPUT_DMA_BUFFER_LENGTH];
 
   /*
-   * 4个PWM通道是否已经执行过一次HAL_TIM_PWM_Start()。
-   * 这个标志就是原g_tim2_pwm_channels_started的通用版本：只启动一次，
+   * 8个PWM通道是否已经执行过一次HAL_TIM_PWM_Start()。
+   * pwm_channels_started：只启动一次
    * 之后帧间保持通道使能并用CCR=0主动输出低电平。
    */
   volatile bool pwm_channels_started;
@@ -97,12 +82,19 @@ typedef struct
  */
 typedef struct
 {
-  /* active是下一次DMA读取的A/B编号，prepare是主循环下一次写入的编号。 */
+  /* active是下一次DMA读取的A/B编号，prepare是主循环下一次写入的编号。
+  *  ready是缓冲区构建完成的编号，所以active和ready可能相同。DMA完成后，active和ready会同时切换到另一块缓冲区。
+  *
+  */
   volatile uint8_t active_buffer_index;
   volatile uint8_t prepare_buffer_index;
   volatile uint8_t ready_buffer_index;
 
   /* TIM7是否已经提出准备请求，以及主循环是否正在构建整组缓冲区。 */
+  /**
+   * prepare_requested = false不代表缓冲区已经构建完成，只代表"请求已经被主循环接走"，主循环接到就会置prepare_requested为false
+   * 
+   */
   volatile bool prepare_requested;
   volatile bool prepare_in_progress;
 
@@ -166,7 +158,7 @@ static void DShotOutput_ExitCritical(uint32_t previous_primask);
 
 //first_output_index是用来选择是哪个TIM的对应4个Dshot通道的
 //DShotOutput_BuildTimerDmaBuffer这个函数就是只能一次使用一组TIM的4个DShot通道，不能同时使用两组TIM的8个DShot通道，所以first_output_index只能是0或4，分别对应DShot1..4和DShot5..8
-bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
+static bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
                                      uint32_t* out_dma_buffer,
                                      uint16_t buffer_capacity)
 {
@@ -210,7 +202,7 @@ bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
 
   /*
    * 最后2个slot全部写0。PWM1模式下CCR=0表示整个周期保持低电平，
-   * 与停止帧中的逻辑0（CCR=30）含义不同。
+   * 与停止帧中的逻辑0（CCR=28）含义不同。
    */
   for (slot_index = DSHOT_OUTPUT_DATA_SLOT_COUNT;
        slot_index < DSHOT_OUTPUT_TOTAL_SLOT_COUNT;
@@ -231,7 +223,7 @@ bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
 }
 
 //启动一个 TIM的Update DMA Burst。
-HAL_StatusTypeDef DShotOutput_StartTimerDma(
+static HAL_StatusTypeDef DShotOutput_StartTimerDma(
     TIM_HandleTypeDef* htim,
     const uint32_t* dma_buffer,
     uint16_t dma_buffer_length)
@@ -267,7 +259,7 @@ HAL_StatusTypeDef DShotOutput_StartTimerDma(
 }
 
 //停止Update DMA Burst，并让HAL内部DMA Burst状态恢复为可再次启动。
-HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim)
+static HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim)
 {
   if ((htim == NULL) ||
       (htim->Instance == NULL) ||
@@ -284,7 +276,7 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim)
   return HAL_TIM_DMABurst_WriteStop(htim, TIM_DMA_UPDATE);
 }
 
-HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
+HAL_StatusTypeDef DShotOutput_StartPeriodic(void)
 {
   HAL_StatusTypeDef status;
   uint32_t previous_primask;
@@ -310,6 +302,8 @@ HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
    * A、B缓冲区都完整构建好，再启动TIM7。当前只有TIM2参与；以后启用TIM1后，
    * 这里仍会先同时准备好DShot1～DShot8，第一次中断不会发送半组旧数据。
    */
+
+  //这个if里面D第一次把两个定时器的A/B缓冲区都构建好，保证第一次中断不会发送半组旧数据
   if ((!DShotOutput_BuildEnabledTimerBuffers(0U)) ||
       (!DShotOutput_BuildEnabledTimerBuffers(1U)))
   {
@@ -318,11 +312,12 @@ HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
 
   /*
    * 共享的A/B索引和准备标志只初始化一次。两个定时器上下文始终使用同一个
-   * active_buffer_index，因此未来TIM1与TIM2会发送同一批MotorControl快照。
+   * active_buffer_index，因此TIM1与TIM2会发送同一批MotorControl快照。
    */
   previous_primask = DShotOutput_EnterCritical();
   g_dshot_scheduler.active_buffer_index = 0U;
   g_dshot_scheduler.prepare_buffer_index = 0U;
+  //B缓冲区构建完成，等待TIM7中断调度
   g_dshot_scheduler.ready_buffer_index = 1U;
   g_dshot_scheduler.prepare_requested = false;
   g_dshot_scheduler.prepare_in_progress = false;
@@ -360,8 +355,6 @@ HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
 
   /*
    * 在TIM7开始产生1.5 ms中断之前，逐个启动已启用上下文的4个PWM通道。
-   * 当前循环只会启动TIM2；TIM1上下文存在但scheduler_enabled=false，所以不会
-   * 提前改变DShot5～DShot8引脚。以后启用TIM1时不需要复制另一套启动代码。
    *
    * 每个上下文的pwm_channels_started都是“只启动一次”标志。PWM通道保持使能，
    * 帧间通过CCR=0主动输出低电平，不再使用HAL_TIM_PWM_Stop()使引脚悬空。
@@ -408,7 +401,7 @@ HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void)
  * busy：DMA是否正在发送active缓冲区
  * 
  */
-void DShotOutput_PollTim2Preparation(void)
+void DShotOutput_PollPreparation(void)
 {
   uint8_t buffer_index;
   bool build_succeeded;
@@ -464,6 +457,7 @@ void DShotOutput_PollTim2Preparation(void)
     g_dshot_scheduler.prepare_requested = true;
     g_dshot_scheduler.prepare_error_count++;
   }
+  //构建完成后，将prepare_in_progress标志清零，表示主循环已经完成了缓冲区的构建工作，可以接收新的请求。
   g_dshot_scheduler.prepare_in_progress = false;
   DShotOutput_ExitCritical(previous_primask);
 }
@@ -497,6 +491,7 @@ void DShotOutput_HandleTim7PeriodElapsed(void)
     }
   }
 
+  //此时1.5ms节拍到来
   if (g_dshot_scheduler.ready_buffer_available)
   {
     /*
@@ -520,6 +515,8 @@ void DShotOutput_HandleTim7PeriodElapsed(void)
   /*
    * active的另一块就是下一次inactive准备区。只有没有待处理请求且主循环
    * 没在构建时才发布新请求，避免重复覆盖同一个准备任务。
+   * 
+   * 在没有请求和正在构建的情况下
    */
   if ((!g_dshot_scheduler.prepare_requested) &&
       (!g_dshot_scheduler.prepare_in_progress))
@@ -527,12 +524,14 @@ void DShotOutput_HandleTim7PeriodElapsed(void)
     //使用异或运算符^来切换active_buffer_index的值。如果active_buffer_index是0，那么0 ^ 1U的结果是1；如果active_buffer_index是1，那么1 ^ 1U的结果是0。这样就实现了在0和1之间切换，确保下一次准备缓冲区使用的是另一块缓冲区。
     g_dshot_scheduler.prepare_buffer_index =
         (uint8_t)(g_dshot_scheduler.active_buffer_index ^ 1U);
+
+    //开始下一轮的缓冲区构建请求
     g_dshot_scheduler.prepare_requested = true;
   }
 
   /*
    * 公共发送器先武装所有已启用TIM的DMA，全部成功后再集中使能计数器。
-   * 当前只发送TIM2；以后打开TIM1上下文时，这一处调用会同时启动两组4通道。
+   * 8路Dshot会在同一时刻切换到同一批MotorControl快照，避免前4路使用新命令、后4路仍使用旧命令。
    */
   (void)DShotOutput_SendEnabledTimerGroupOnce();
 }
@@ -606,11 +605,10 @@ static DShotOutputTimerContext* DShotOutput_FindTimerContext(
 
 /*
  * 为同一个A/B编号构建所有已启用定时器的DMA缓冲区。
- * 当前只会构建TIM2的DShot1～DShot4；将TIM1的scheduler_enabled改为true后，
- * 同一次调用还会构建TIM1的DShot5～DShot8。只有全部成功才返回true，调用者
+ * 同一次调用会构建TIM2的DShot1～DShot4和TIM1的DShot5～DShot8。只有全部成功才返回true，调用者
  * 才能发布ready标志，所以不会出现前4路已更新、后4路仍是旧命令的情况。
  * 
- * buffer_index 是 0 或 1，分别对应A/B两块缓冲区。当前只有TIM2参与，所以只会构建DShot1～DShot4；以后启用TIM1后，同一次调用还会构建DShot5～DShot8。
+ * buffer_index 是 0 或 1，分别对应A/B两块缓冲区
  * 这个一次只能构建A或B一块缓冲区，不能同时构建两块缓冲区。因为DMA可能正在读取active缓冲区，主循环只能写另一块prepare缓冲区，防止发送过程中数据被修改。
  */
 static bool DShotOutput_BuildEnabledTimerBuffers(uint8_t buffer_index)
@@ -700,8 +698,8 @@ static HAL_StatusTypeDef DShotOutput_ArmTimerContext(
 /*
  * 公共调度器每到一个TIM7节拍只调用这一个发送入口。
  * 第一轮检查所有已启用上下文都处于可发送状态；第二轮逐个武装DMA；全部成功后
- * 第三轮才启动各定时器。当前只有TIM2参与，因此硬件行为与整理前保持一致。
- * 将来启用TIM1后，两个定时器仍各用自己的busy和诊断计数，但共享本次发送时刻。
+ * 第三轮才启动各定时器。
+ * 两个定时器仍各用自己的busy和诊断计数，但共享本次发送时刻。
  */
 static HAL_StatusTypeDef DShotOutput_SendEnabledTimerGroupOnce(void)
 {
@@ -925,7 +923,7 @@ static void DShotOutput_StopTimerGroup(TIM_HandleTypeDef* htim)
 
   /*
    * 将4个CCR的预装载值和活动值都恢复为0。TIM2计数器虽然停止，但PWM通道
-   * 仍保持使能，所以PA0～PA3会由定时器主动输出低电平，而不是变成高阻状态。
+   * 仍保持使能，所以PA0～PA3会由定时器主动输出低电平，而不是变成高阻状态。（TIM1的4个通道也是一样）
    * 这里故意不调用HAL_TIM_PWM_Stop()：该函数会清除CC1E～CC4E，使电调端的
    * 偏置电路有机会把悬空信号线抬高，AM32可能因此误判为反相/双向DShot。
    */
@@ -943,8 +941,16 @@ static void DShotOutput_StopTimerGroup(TIM_HandleTypeDef* htim)
 }
 
 //DShotOutput_EnterCritical()和DShotOutput_ExitCritical()是用来保护共享状态变量的临界区函数。它们通过禁用和恢复中断来确保在访问共享变量时不会被中断打断，从而避免数据竞争和不一致的状态。
+/*******
+ * 
+ * 这两个函数就是如果一开始就有中断关闭，那么就不再打开中断，保持原来的状态。
+ * 只有在原来中断是开启的情况下，才会先关闭，之后重新开启中断。
+ * 
+ */
 static uint32_t DShotOutput_EnterCritical(void)
 {
+  //previous_primask =0代表中断是开启的，previous_primask =1代表中断是关闭的。
+  //__get_PRIMASK()函数用于获取当前中断状态寄存器的值，返回值为0表示中断允许，返回值为1表示中断禁止。
   uint32_t previous_primask = __get_PRIMASK();
 
   __disable_irq();
@@ -965,7 +971,7 @@ static void DShotOutput_ExitCritical(uint32_t previous_primask)
 
 /*
  * update DMA正常完成时，HAL内部最终会调用这个官方弱回调。这里只做分发，
- * TIM7基本定时中断和TIM2 DMA完成最终都会进入这个同名官方回调，所以必须
+ * TIM7基本定时中断和TIM2 DMA以及TIM1 DMA完成最终都会进入这个同名官方回调，所以必须
  * 先根据句柄区分来源。以后增加TIM1时也继续复用同一个入口。
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)

@@ -48,10 +48,12 @@ extern "C" {
  *
  * @retval true  缓冲区构建成功。
  * @retval false 索引、指针或容量无效，没有写入缓冲区。
+ * 
+ * 该函数改成了static函数，避免外部调用。外部调用DShotOutput_PollPreparation()即可。
  */
-bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
-                                     uint32_t* out_dma_buffer,
-                                     uint16_t buffer_capacity);
+//bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
+//                                      uint32_t* out_dma_buffer,
+//                                      uint16_t buffer_capacity);
 
 /**
  * @brief 为一个TIM启动update DMA burst，令一次更新事件连续写CCR1～CCR4。
@@ -68,11 +70,13 @@ bool DShotOutput_BuildTimerDmaBuffer(uint8_t first_output_index,
  * @param dma_buffer_length DMA数据总长度，当前必须等于72个word。
  *
  * @return HAL_OK表示DMA burst启动成功；其余返回HAL_ERROR或HAL_BUSY。
+ * 
+ * 该函数改成了static函数，避免外部调用。外部调用DShotOutput_SendEnabledTimerGroupOnce()即可。
  */
-HAL_StatusTypeDef DShotOutput_StartTimerDma(
-    TIM_HandleTypeDef* htim,
-    const uint32_t* dma_buffer,
-    uint16_t dma_buffer_length);
+// HAL_StatusTypeDef DShotOutput_StartTimerDma(
+//     TIM_HandleTypeDef* htim,
+//     const uint32_t* dma_buffer,
+//     uint16_t dma_buffer_length);
 
 /**
  * @brief 停止一个TIM的update DMA burst并恢复HAL内部的ready状态。
@@ -84,17 +88,19 @@ HAL_StatusTypeDef DShotOutput_StartTimerDma(
  *
  * @param htim 定时器句柄。
  * @return HAL状态。
+ * 
+ * 该函数改成了static函数，避免外部调用。外部调用DShotOutput_HandleTimerPeriodElapsed()即可。
  */
-HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
+// HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
 
 /**
  * @brief 启动由TIM7提供1.5 ms硬件节拍的DShot公共调度器。
  *
- * 调用前必须已经执行MX_TIM2_Init()、MX_TIM7_Init()和MotorControl_Init()。
+ * 调用前必须已经执行MX_TIM1_Init()、MX_TIM2_Init()、MX_TIM7_Init()和MotorControl_Init()。
  * 内部已经采用“TIM1/TIM2两个私有上下文＋一个公共调度器”。本函数会先为
  * 所有已启用上下文构建A/B两块完整停止帧，再启动TIM7更新中断。
- * 当前仅TIM2上下文启用，TIM1上下文已经预留但不会启动或改变DShot5～DShot8。
- * TIM2 CH1～CH4在这里一次性使能，此后帧间通过CCR=0主动输出低电平。
+ * 
+ * TIM2 和 TIM1 的 CH1～CH4在这里一次性使能，此后帧间通过CCR=0主动输出低电平。
  *
  * 当前配置要求TIM7输入时钟48 MHz、PSC=47、ARR=1499。周期计算为：
  * 48 MHz / (47 + 1) = 1 MHz，(1499 + 1) / 1 MHz = 1.5 ms。
@@ -102,7 +108,7 @@ HAL_StatusTypeDef DShotOutput_StopTimerDma(TIM_HandleTypeDef* htim);
  * @return HAL_OK表示固定周期已经启动；配置不匹配返回HAL_ERROR；
  *         重复启动返回HAL_BUSY。
  */
-HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void);
+HAL_StatusTypeDef DShotOutput_StartPeriodic(void);
 
 /**
  * @brief 在主循环中准备下一周期使用的整组双缓冲数据。
@@ -112,7 +118,7 @@ HAL_StatusTypeDef DShotOutput_StartTim2Periodic(void);
  * 所有缓冲全部写完后才发布ready标志，所以中断不会读到半组新、半组旧数据。
  * 本函数不等待、不启动DMA；没有准备请求时会立即返回。
  */
-void DShotOutput_PollTim2Preparation(void);
+void DShotOutput_PollPreparation(void);
 
 /**
  * @brief 处理一个TIM7的1.5 ms更新节拍。
@@ -128,8 +134,7 @@ void DShotOutput_HandleTim7PeriodElapsed(void);
  * @brief 处理HAL通知的TIM update DMA正常完成事件。
  *
  * 函数会根据句柄查找TIM1或TIM2上下文，并只清理、计数对应的那一组。
- * 当前TIM1调度关闭，但它的完成处理路径已经具备，不再需要增加TIM1分支。
- *
+ * 
  * @param htim 产生DMA完成事件的TIM句柄。
  */
 void DShotOutput_HandleTimerPeriodElapsed(TIM_HandleTypeDef* htim);

@@ -65,9 +65,11 @@ bool MotorControl_AreAllDShotCommandsStopped(void);
  *
  * @retval true  映射成功，out_dshot_command 已被写入。
  * @retval false 输入超出 RawCommand 有效范围或输出指针为空，输出保持不变。
+ * 
+ * 改为了static函数，避免外部调用。外部调用MotorControl_UpdateDShotCommands()即可。
  */
-bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
-                                       uint16_t* out_dshot_command);
+// bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
+//                                        uint16_t* out_dshot_command);
 
 /**
  * @brief 把一条 RawCommand 中的多路数据映射并保存为 8 路 DShot 命令。
