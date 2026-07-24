@@ -21,6 +21,7 @@
 #include "main.h"
 #include "can.h"
 #include "dma.h"
+#include "iwdg.h"
 #include "tim.h"
 #include "gpio.h"
 
@@ -93,6 +94,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_TIM7_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   if (DroneCAN_App_Init() != HAL_OK)
   {
@@ -109,6 +111,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     DroneCAN_App_Poll();
+
+    //添加400ms的喂狗操作，防止看门狗复位
+    HAL_IWDG_Refresh(&hiwdg);
   }
   /* USER CODE END 3 */
 }
@@ -125,8 +130,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
