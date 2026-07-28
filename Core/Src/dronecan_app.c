@@ -601,6 +601,10 @@ static void DroneCAN_PollDShotSend(void)
 static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
 {
   CAN_FilterTypeDef filter = {0};
+  uint32_t dronecan_raw_command_id;
+  uint32_t dronecan_raw_command_mask;
+  uint32_t bxcan_filter_id;
+  uint32_t bxcan_filter_mask;
 
   /*
    * 第一阶段调试用 filter：接收所有 CAN frame 到 FIFO0。
@@ -608,22 +612,85 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
    * DroneCAN 使用 29-bit extended CAN ID。后续在接收桥接代码里，我们会丢弃
    * 不是 extended frame 的数据。当前硬件 filter 先放宽，是为了让早期总线
    * 调试更简单；等 RawCommand 接收验证通过后，可以再把 filter 收窄。
+   *
+   * 本阶段补充：RawCommand 接收已经验证通过，现在硬件过滤器已经收窄，不再
+   * 接收总线上的全部报文。只有同时满足以下条件的 CAN 帧才会进入 FIFO0：
+   *   1. 使用 29-bit extended CAN ID；
+   *   2. 是数据帧而不是 remote frame；
+   *   3. CAN ID bit 7 为 0，即 DroneCAN message/broadcast，而不是 service；
+   *   4. CAN ID bit 23..8 的数据类型 ID 等于 RawCommand 的 1030。
+   *
+   * CAN ID bit 28..24 是 DroneCAN priority，本过滤器不比较这些位，因此不同
+   * 优先级的 RawCommand 都能通过。CAN ID bit 6..0 是 source node ID，本过滤器
+   * 也不比较这些位，因此不会把飞控 Node ID 写死在固件中。
+   *
+   * PM08 的电池信息也是 DroneCAN 广播，但它的数据类型 ID 不是 1030，所以会
+   * 在 bxCAN 硬件过滤器这一层被拒绝，不会再进入 FIFO0、中断软件队列和
+   * canardHandleRxFrame()。
    * 
    * CAN_FILTERMODE_IDMASK：ID + mask 模式
    * CAN_FILTERSCALE_32BIT：使用 32 位过滤器格式。DroneCAN 使用 29-bit extended CAN ID，所以用 32-bit scale 合适；16-bit scale 更偏向较短的标准 ID 场景。
    * FilterIdHigh/Low：要匹配的目标 ID，被拆成高 16 位和低 16 位。
-   * FilterMaskIdHigh/Low：哪些 ID 位需要比较。当前都是 0，所以不比较任何位，也就是接收全部。
+   * FilterMaskIdHigh/Low：哪些 ID 位需要比较。第一阶段时都是 0，所以不比较任何位，也就是接收全部；本阶段会按上述规则设置相应掩码位。
    * FilterFIFOAssignment = CAN_FILTER_FIFO0：通过过滤器的帧放进 RX FIFO0。
    * SlaveStartFilterBank = 14;在单 CAN中这个字段不会生效，真正使用的是 filter.FilterBank = 0;
    */
 
+  /*
+   * DroneCAN 广播 message 的 29-bit CAN ID 布局：
+   *
+   *   bit 28..24：priority
+   *   bit 23..8 ：16-bit message data type ID
+   *   bit 7     ：service not message，广播 message 必须为 0
+   *   bit 6..0  ：source node ID
+   *
+   * RawCommand 的生成头文件统一定义数据类型 ID 为 1030。这里先把 1030 放到
+   * CAN ID 的 bit 23..8。priority、bit 7 和 source node ID 在目标值中保持 0；
+   * 其中 priority/source 对应的 mask 为 0，所以它们的目标值实际不会参与比较。
+   */
+  dronecan_raw_command_id =
+      ((uint32_t)UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID << 8U);
+
+  /*
+   * 掩码中的 1 表示“必须比较”，0 表示“忽略”：
+   *
+   *   0xFFFF << 8：比较完整的 16-bit data type ID；
+   *   1 << 7     ：比较 service/message 位，并要求它等于目标 ID 中的 0，
+   *                从而只允许 DroneCAN message/broadcast；
+   *   priority 和 source node ID 没有置 1，因此不限制它们。
+   */
+  dronecan_raw_command_mask =
+      (0xFFFFUL << 8U) |
+      (1UL << 7U);
+
+  /*
+   * STM32 bxCAN 的 32-bit 过滤器寄存器并不是直接保存 29-bit CAN ID：
+   *
+   *   filter bit 31..3：29-bit extended CAN ID
+   *   filter bit 2    ：IDE，1 表示扩展帧
+   *   filter bit 1    ：RTR，0 表示数据帧，1 表示远程帧
+   *   filter bit 0    ：保留位
+   *
+   * 所以先把 DroneCAN ID 和它的 mask 整体左移 3 位。目标中的 IDE 设为 1，
+   * mask 中也比较 IDE，确保标准帧不能通过。目标 RTR 保持 0，mask 中比较 RTR，
+   * 确保 remote frame 不能通过。
+   */
+  bxcan_filter_id =
+      (dronecan_raw_command_id << 3U) |
+      CAN_ID_EXT;
+
+  bxcan_filter_mask =
+      (dronecan_raw_command_mask << 3U) |
+      CAN_ID_EXT |
+      (1UL << 1U);
+
   filter.FilterBank = 0;
   filter.FilterMode = CAN_FILTERMODE_IDMASK;
   filter.FilterScale = CAN_FILTERSCALE_32BIT;
-  filter.FilterIdHigh = 0x0000;
-  filter.FilterIdLow = 0x0000;
-  filter.FilterMaskIdHigh = 0x0000;
-  filter.FilterMaskIdLow = 0x0000;
+  filter.FilterIdHigh = (bxcan_filter_id >> 16U) & 0xFFFFU;
+  filter.FilterIdLow = bxcan_filter_id & 0xFFFFU;
+  filter.FilterMaskIdHigh = (bxcan_filter_mask >> 16U) & 0xFFFFU;
+  filter.FilterMaskIdLow = bxcan_filter_mask & 0xFFFFU;
   filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
   filter.FilterActivation = ENABLE;
   filter.SlaveStartFilterBank = 14;   //0~27
