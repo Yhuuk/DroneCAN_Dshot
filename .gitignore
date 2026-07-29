@@ -17,3 +17,7 @@ Desktop.ini
 
 # 调试文件
 EventRecorderStub.scvd
+
+# CMake编译产物
+/build/
+/debug.log
