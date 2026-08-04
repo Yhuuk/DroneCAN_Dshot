@@ -778,7 +778,8 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
  * data_type_id 是 DroneCAN 的数据类型 ID，表示这个 transfer 的类型。判断是不是 uavcan.equipment.esc.RawCommand 就是看这个 ID。
  * transfer_type 是 transfer 的类型，可以是广播、单播等。判断是不是广播消息就看这个参数。
  * source_node_id 是发送这个 transfer 的节点 ID。比如，飞控 Node ID = 10 当前的转换板 Node ID = 42。如果是匿名节点发送的广播消息，这个值就是 0。
- * 现在 source_node_id 没用上，就是不限制广播消息来源
+ * RawCommand 不限制消息来源；DirectionCommand 只接受电脑端固定节点 ID 126，
+ * 与前面的 CAN 硬件过滤器保持一致。
  */
 static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
                                           uint64_t* out_data_type_signature,
@@ -787,7 +788,6 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
                                           uint8_t source_node_id)
 {
   (void)ins;
-  (void)source_node_id;
 
   /*
    * libcanard 在收到一个新的 transfer 时，会调用这个回调函数，询问应用层是否要接收这个 transfer。
@@ -795,9 +795,9 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
    * 下一步接好 CAN RX 队列之后，这里会开始接受
    * uavcan.equipment.esc.RawCommand，并返回它的 data type signature。
    *
-   * 本阶段补充：CAN RX 队列已经接好，现在只接受广播形式的
-   * uavcan.equipment.esc.RawCommand。其他消息和服务仍然返回 false，
-   * 避免 libcanard 为当前应用不需要的数据类型分配接收内存。
+   * 本阶段补充：CAN RX 队列已经接好，现在接受广播形式的 RawCommand，
+   * 以及来自指定电脑端节点的 DirectionCommand。其他消息和服务仍然返回
+   * false，避免 libcanard 为当前应用不需要的数据类型分配接收内存。
    */
   //CanardTransferTypeBroadcast是libcanard定义的枚举值，表示这个 transfer 是广播类型。
   if ((transfer_type == CanardTransferTypeBroadcast) &&
@@ -809,6 +809,17 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
      * 即使 CAN 帧已经全部收到，也不能得到一个有效的 RawCommand transfer。
      */
     *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
+    return true;
+  }
+  else if ((transfer_type == CanardTransferTypeBroadcast) &&
+           (data_type_id == DRONECAN_DSHOT_DIRECTIONCOMMAND_ID) &&
+           (source_node_id == DRONECAN_DIRECTION_COMMAND_SOURCE_NODE_ID))
+  {
+    /*
+     * DirectionCommand 的签名由自定义 DSDL 生成文件统一提供。
+     * 这里再次检查 source node ID，作为硬件过滤器之后的软件层校验。
+     */
+    *out_data_type_signature = DRONECAN_DSHOT_DIRECTIONCOMMAND_SIGNATURE;
     return true;
   }
 
@@ -832,8 +843,6 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
 static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                         CanardRxTransfer* transfer)
 {
-  struct uavcan_equipment_esc_RawCommand raw_command = {0};
-
   (void)ins;
 
   /*
@@ -844,13 +853,16 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
    * 还不会更新定时器、DMA 或任何 DShot 输出。
    * 本阶段再次补充：解码成功后会把前 8 路交给 motor_control 做安全映射，
    * 当前仍然只更新 RAM 中的 DShot 命令缓存。
+   * 本阶段再次补充：DirectionCommand 已经能够进入独立分支并完成 DSDL
+   * 解码，具体的电机换向处理将在后续 direction_command 模块中实现。
    */
   if ((transfer->transfer_type != CanardTransferTypeBroadcast) ||
-      (transfer->data_type_id != UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID))
+      ((transfer->data_type_id != UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID) &&
+       (transfer->data_type_id != DRONECAN_DSHOT_DIRECTIONCOMMAND_ID)))
   {
     /*
-     * ShouldAcceptTransfer 当前只允许 RawCommand 广播。这里再次检查类型，
-     * 是为了让以后增加其他 DroneCAN 数据类型时，各类型仍有明确的处理入口。
+     * ShouldAcceptTransfer 当前只允许这两种广播消息。这里再次检查类型，
+     * 让每种 DroneCAN 数据类型都有明确的处理入口。
      */
     return;
   }
@@ -859,44 +871,66 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
    * 生成的 decode 函数返回 false 表示成功，返回 true 表示 Payload 非法。
    * 它会处理 RawCommand 的 14-bit 有符号数组和多帧 Payload，应用层不需要
    * 自己按照字节或位偏移解析 transfer。
+   * 根据 data_type_id 只调用对应消息的解码函数；对应解码函数返回 true，
+   * 就表示当前这条消息解码失败。
    */
-  if (uavcan_equipment_esc_RawCommand_decode(transfer, &raw_command))
+  if (transfer->data_type_id == UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID)
   {
-    g_raw_command_decode_error_count++;
-    return;
-  }
+    struct uavcan_equipment_esc_RawCommand raw_command = {0};
 
-  /*
-   * cmd.data[0..7] 分别对应 DShot1..DShot8。少于 8 路时，motor_control
-   * 会把缺少的输出保存为停止；多于 8 路时，本节点只使用前 8 路。
-   * 如果映射失败，motor_control 会把全部输出命令安全置零。
-   */
-  //raw_command.cmd.data 本身是一个数组，raw_command.cmd.len 是数组的长度。
-  //所以传给函数时会自动变成首元素地址
-  if (!MotorControl_UpdateDShotCommands(raw_command.cmd.data,
-                                         raw_command.cmd.len,
-                                         transfer->timestamp_usec))
+    if (uavcan_equipment_esc_RawCommand_decode(transfer, &raw_command))
+    {
+      g_raw_command_decode_error_count++;
+      return;
+    }
+
+    /*
+    * cmd.data[0..7] 分别对应 DShot1..DShot8。少于 8 路时，motor_control
+    * 会把缺少的输出保存为停止；多于 8 路时，本节点只使用前 8 路。
+    * 如果映射失败，motor_control 会把全部输出命令安全置零。
+    */
+    //raw_command.cmd.data 本身是一个数组，raw_command.cmd.len 是数组的长度。
+    //所以传给函数时会自动变成首元素地址
+    if (!MotorControl_UpdateDShotCommands(raw_command.cmd.data,
+                                          raw_command.cmd.len,
+                                          transfer->timestamp_usec))
+    {
+      //映射失败时只增加错误计数，不覆盖上一条已经验证有效的命令。
+      //本阶段补充：为保证安全，motor_control 会把缓存命令全部置零并取消超时计时状态。
+      g_raw_command_mapping_error_count++;
+      DroneCAN_EnterDShotWaitZeroState();
+      return;
+    }
+
+    /* 映射和CCR构建全部成功，通知主循环发送最新的DShot1～DShot8。 */
+    /*
+    * 本阶段补充：发送已经改成TIM7固定1.5 ms，这里不再提出单次pending请求。
+    * 回调只更新启动状态：WAIT_ZERO期间非零命令会被强制替换成停止帧；
+    * 连续零命令满1 s进入RUNNING后，最新映射值才可由调度器输出。
+    */
+    DroneCAN_HandleMappedRawCommand(transfer->timestamp_usec);
+
+    /*
+    * 只有完整且解码成功的命令才会更新调试状态。received_count 最后增加，
+    * 在 debugger 中看到计数变化时，前面的命令内容和来源 Node ID 已经写好。
+    */
+    g_last_raw_command = raw_command;
+    g_last_raw_command_source_node_id = transfer->source_node_id;
+    g_raw_command_received_count++;
+  }
+  else if (transfer->data_type_id == DRONECAN_DSHOT_DIRECTIONCOMMAND_ID)
   {
-    //映射失败时只增加错误计数，不覆盖上一条已经验证有效的命令。
-    //本阶段补充：为保证安全，motor_control 会把缓存命令全部置零并取消超时计时状态。
-    g_raw_command_mapping_error_count++;
-    DroneCAN_EnterDShotWaitZeroState();
-    return;
+    /* 这是由自定义 DSDL 生成的电机转向命令结构体，所有成员先初始化为 0。 */
+    struct dronecan_dshot_DirectionCommand direction_command = {0};
+
+    if (dronecan_dshot_DirectionCommand_decode(transfer, &direction_command))
+    {
+      return;
+    }
+
+    /*
+     * DirectionCommand 已经解码到 direction_command 中。
+     * 下一步在这里调用独立模块，校验并执行对应电机的换向操作。
+     */
   }
-
-  /* 映射和CCR构建全部成功，通知主循环发送最新的DShot1～DShot8。 */
-  /*
-   * 本阶段补充：发送已经改成TIM7固定1.5 ms，这里不再提出单次pending请求。
-   * 回调只更新启动状态：WAIT_ZERO期间非零命令会被强制替换成停止帧；
-   * 连续零命令满1 s进入RUNNING后，最新映射值才可由调度器输出。
-   */
-  DroneCAN_HandleMappedRawCommand(transfer->timestamp_usec);
-
-  /*
-   * 只有完整且解码成功的命令才会更新调试状态。received_count 最后增加，
-   * 在 debugger 中看到计数变化时，前面的命令内容和来源 Node ID 已经写好。
-   */
-  g_last_raw_command = raw_command;
-  g_last_raw_command_source_node_id = transfer->source_node_id;
-  g_raw_command_received_count++;
 }
