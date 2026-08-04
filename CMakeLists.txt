@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/motor_control.c
     third_party/libcanard/canard.c
     third_party/dronecan_dsdl_generated/src/uavcan.equipment.esc.RawCommand.c
+    third_party/dronecan_dsdl_generated/src/dronecan_dshot.DirectionCommand.c
 )
 
 # Add include paths
