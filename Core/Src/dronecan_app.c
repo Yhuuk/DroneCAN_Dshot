@@ -5,6 +5,7 @@
 #include "dshot_output.h"
 #include "motor_control.h"
 
+#include "dronecan_dshot.DirectionCommand.h"
 #include "uavcan.equipment.esc.RawCommand.h"
 
 /*
@@ -52,6 +53,13 @@
  * 后续如果需要，可以把这里改成参数配置，或者实现 dynamic node allocation。
  */
 #define DRONECAN_APP_NODE_ID             42U
+
+/*
+ * 电脑端 DroneCAN 调试工具使用的固定源节点 ID。
+ * DirectionCommand 的硬件过滤器会比较 CAN ID 的 source node ID，因此电脑端
+ * 必须使用同一个节点 ID；如果以后修改电脑端节点 ID，只需同步修改这个宏。
+ */
+#define DRONECAN_DIRECTION_COMMAND_SOURCE_NODE_ID  126U
 
 /*
  * libcanard 不自己 malloc，而是使用应用层提供的内存池。
@@ -601,8 +609,11 @@ static void DroneCAN_PollDShotSend(void)
 static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
 {
   CAN_FilterTypeDef filter = {0};
+  HAL_StatusTypeDef status;
   uint32_t dronecan_raw_command_id;
   uint32_t dronecan_raw_command_mask;
+  uint32_t dronecan_direction_command_id;
+  uint32_t dronecan_direction_command_mask;
   uint32_t bxcan_filter_id;
   uint32_t bxcan_filter_mask;
 
@@ -633,7 +644,10 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
    * FilterIdHigh/Low：要匹配的目标 ID，被拆成高 16 位和低 16 位。
    * FilterMaskIdHigh/Low：哪些 ID 位需要比较。第一阶段时都是 0，所以不比较任何位，也就是接收全部；本阶段会按上述规则设置相应掩码位。
    * FilterFIFOAssignment = CAN_FILTER_FIFO0：通过过滤器的帧放进 RX FIFO0。
-   * SlaveStartFilterBank = 14;在单 CAN中这个字段不会生效，真正使用的是 filter.FilterBank = 0;
+   * FilterBank：选择要配置的硬件过滤器槽位。Bank 0 和 Bank 1 是两套彼此
+   * 独立的匹配规则；任意一个 bank 匹配成功，CAN 帧就可以进入指定 FIFO。
+   * SlaveStartFilterBank = 14：用于双 CAN 器件划分 CAN1/CAN2 的过滤器 bank；
+   * 当前只有 CAN1，实际使用的 Bank 0 和 Bank 1 都位于 CAN1 侧。
    */
 
   /*
@@ -684,6 +698,11 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
       CAN_ID_EXT |
       (1UL << 1U);
 
+  /*
+   * Bank 0 保留给飞控发送的 RawCommand。
+   * 不能把这里直接改成 1，否则只会把原来的 RawCommand 规则搬到 Bank 1，
+   * Bank 0 不再配置，也不会自动多出 DirectionCommand 过滤规则。
+   */
   filter.FilterBank = 0;
   filter.FilterMode = CAN_FILTERMODE_IDMASK;
   filter.FilterScale = CAN_FILTERSCALE_32BIT;
@@ -695,6 +714,58 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
   filter.FilterActivation = ENABLE;
   filter.SlaveStartFilterBank = 14;   //0~27
 
+  status = HAL_CAN_ConfigFilter(&hcan1, &filter);
+  if (status != HAL_OK)
+  {
+    /* Bank 0 配置失败时立即返回，不能带着不确定的 RawCommand 接收状态继续启动。 */
+    return status;
+  }
+
+  /*
+   * Bank 1 专门接收电脑端发送的 DirectionCommand：
+   *
+   *   bit 23..8：必须等于自定义消息的数据类型 ID 20900；
+   *   bit 7    ：必须为 0，只允许 DroneCAN 广播 message；
+   *   bit 6..0 ：必须等于电脑端节点 ID 126；
+   *   priority ：不比较，允许电脑端使用任意合法 DroneCAN 优先级。
+   *
+   * 与 Bank 0 相比，Bank 1 额外比较 source node ID。这样即使其它节点碰巧
+   * 使用了相同的厂商自定义数据类型 ID，也不能通过这个硬件过滤器。
+   */
+  dronecan_direction_command_id =
+      ((uint32_t)DRONECAN_DSHOT_DIRECTIONCOMMAND_ID << 8U) |
+      (uint32_t)DRONECAN_DIRECTION_COMMAND_SOURCE_NODE_ID;
+
+  dronecan_direction_command_mask =
+      (0xFFFFUL << 8U) |
+      (1UL << 7U) |
+      0x7FUL;
+
+  /*
+   * 与 Bank 0 使用完全相同的 bxCAN 寄存器布局转换：
+   * 29-bit DroneCAN ID 左移 3 位，并明确比较 IDE=1、RTR=0，保证只允许
+   * 29-bit 扩展数据帧，标准帧和远程帧都不能通过。
+   */
+  bxcan_filter_id =
+      (dronecan_direction_command_id << 3U) |
+      CAN_ID_EXT;
+
+  bxcan_filter_mask =
+      (dronecan_direction_command_mask << 3U) |
+      CAN_ID_EXT |
+      (1UL << 1U);
+
+  filter.FilterBank = 1;
+  filter.FilterIdHigh = (bxcan_filter_id >> 16U) & 0xFFFFU;
+  filter.FilterIdLow = bxcan_filter_id & 0xFFFFU;
+  filter.FilterMaskIdHigh = (bxcan_filter_mask >> 16U) & 0xFFFFU;
+  filter.FilterMaskIdLow = bxcan_filter_mask & 0xFFFFU;
+
+  /*
+   * Mode、Scale、FIFO 和 Activation 沿用上面已经填写的公共配置。
+   * 两个 bank 都指向 FIFO0，所以后续仍由现有的 RX FIFO0 中断、软件环形
+   * 队列和 libcanard 入口统一处理，不需要再增加 FIFO1 中断路径。
+   */
   return HAL_CAN_ConfigFilter(&hcan1, &filter);
 }
 
