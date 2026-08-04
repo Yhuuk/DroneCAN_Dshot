@@ -1,0 +1,43 @@
+#
+# Direction configuration command for the DroneCAN-DShot converter.
+#
+# This message is only used while all motors are stopped.
+# A successfully accepted request permanently changes the selected ESC
+# directions by sending DShot command 7 or 8 followed by command 12.
+#
+
+uint8 PROTOCOL_VERSION = 1
+
+uint8 OPERATION_SET_NORMAL   = 1
+uint8 OPERATION_SET_REVERSED = 2
+
+uint16 CONFIRMATION_VALUE = 42330   # 0xA55A
+
+#
+# Message format version. The current sender shall set this field to 1.
+#
+uint8 protocol_version
+
+#
+# 1: Set the selected ESCs to normal direction.
+# 2: Set the selected ESCs to reversed direction.
+#
+uint8 operation
+
+#
+# Each bit selects one DShot output:
+# bit0 = DShot1, bit1 = DShot2, ..., bit7 = DShot8.
+#
+uint8 motor_mask
+
+#
+# Unique identifier assigned by the PC for this operation.
+# It is used by the receiver to recognize duplicate requests.
+#
+uint16 request_id
+
+#
+# Must equal CONFIRMATION_VALUE (0xA55A).
+# This field reduces the risk of accidental direction changes.
+#
+uint16 confirmation
