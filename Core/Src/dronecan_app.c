@@ -2,10 +2,10 @@
 
 #include "can.h"
 #include "canard.h"
+#include "direction_command.h"
 #include "dshot_output.h"
 #include "motor_control.h"
 
-#include "dronecan_dshot.DirectionCommand.h"
 #include "uavcan.equipment.esc.RawCommand.h"
 
 /*
@@ -53,13 +53,6 @@
  * 后续如果需要，可以把这里改成参数配置，或者实现 dynamic node allocation。
  */
 #define DRONECAN_APP_NODE_ID             42U
-
-/*
- * 电脑端 DroneCAN 调试工具使用的固定源节点 ID。
- * DirectionCommand 的硬件过滤器会比较 CAN ID 的 source node ID，因此电脑端
- * 必须使用同一个节点 ID；如果以后修改电脑端节点 ID，只需同步修改这个宏。
- */
-#define DRONECAN_DIRECTION_COMMAND_SOURCE_NODE_ID  126U
 
 /*
  * libcanard 不自己 malloc，而是使用应用层提供的内存池。
@@ -126,6 +119,7 @@ static volatile uint8_t g_last_raw_command_source_node_id = 0U;
 static volatile uint32_t g_raw_command_received_count = 0U;
 static volatile uint32_t g_raw_command_decode_error_count = 0U;
 static volatile uint32_t g_raw_command_mapping_error_count = 0U;
+static volatile uint32_t g_raw_command_ignored_while_direction_count = 0U;
 
 typedef enum
 {
@@ -207,6 +201,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
    * 到来时就能直接发送完整的0x0000帧。
    */
   MotorControl_Init();
+  DirectionCommand_Init();
   g_dshot_state = DRONECAN_DSHOT_STATE_WAIT_ZERO;
   DroneCAN_ResetDShotZeroHold();
 
@@ -323,6 +318,23 @@ void DroneCAN_App_Poll(void)
   MotorControl_Poll(now_usec);
 
   /*
+   * 换向状态机在主循环中推进，不在libcanard回调或TIM7中断里阻塞等待。
+   * 执行期间保持启动互锁为WAIT_ZERO，但不能调用EnterDShotWaitZeroState()，
+   * 因为那个函数会强制写入停止帧，进而覆盖状态机正在发送的特殊命令。
+   */
+  DirectionCommand_Poll(now_usec);
+  if (DirectionCommand_IsBusy())
+  {
+    g_dshot_state = DRONECAN_DSHOT_STATE_WAIT_ZERO;
+    DroneCAN_ResetDShotZeroHold();
+  }
+  else
+  {
+    /* 换向结束后必须重新完成连续零帧启动互锁，才会再次接受实际油门。 */
+    DroneCAN_PollDShotState(now_usec);
+  }
+
+  /*
    * 收到并成功映射RawCommand后，在主循环中使用TIM2发送一次DShot1～DShot4和
    * TIM1发送一次DShot5～DShot8。一次DMA发送约30 us；
    * 本阶段补充：现在不再由pending触发发送。下面先更新1 s启动/超时状态机，
@@ -330,7 +342,6 @@ void DroneCAN_App_Poll(void)
    * TIM7中断触发。因此无命令时也会持续发停止帧，RawCommand到达时间抖动
    * 不会直接变成DShot帧间隔抖动。
    */
-  DroneCAN_PollDShotState(now_usec);
   DroneCAN_PollDShotSend();
 }
 
@@ -734,7 +745,7 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
    */
   dronecan_direction_command_id =
       ((uint32_t)DRONECAN_DSHOT_DIRECTIONCOMMAND_ID << 8U) |
-      (uint32_t)DRONECAN_DIRECTION_COMMAND_SOURCE_NODE_ID;
+      (uint32_t)DIRECTION_COMMAND_ALLOWED_SOURCE_NODE_ID;
 
   dronecan_direction_command_mask =
       (0xFFFFUL << 8U) |
@@ -813,7 +824,7 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
   }
   else if ((transfer_type == CanardTransferTypeBroadcast) &&
            (data_type_id == DRONECAN_DSHOT_DIRECTIONCOMMAND_ID) &&
-           (source_node_id == DRONECAN_DIRECTION_COMMAND_SOURCE_NODE_ID))
+           (source_node_id == DIRECTION_COMMAND_ALLOWED_SOURCE_NODE_ID))
   {
     /*
      * DirectionCommand 的签名由自定义 DSDL 生成文件统一提供。
@@ -885,6 +896,20 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
     }
 
     /*
+     * DirectionCommand从被Submit接受起就取得电机输出控制权。此时仍记录
+     * 收到的RawCommand用于调试，但绝不能让普通油门覆盖方向/保存特殊命令。
+     * 换向完成后还会重新执行连续零帧启动互锁，不会直接恢复这条旧油门。
+     */
+    if (DirectionCommand_IsBusy())
+    {
+      g_last_raw_command = raw_command;
+      g_last_raw_command_source_node_id = transfer->source_node_id;
+      g_raw_command_received_count++;
+      g_raw_command_ignored_while_direction_count++;
+      return;
+    }
+
+    /*
     * cmd.data[0..7] 分别对应 DShot1..DShot8。少于 8 路时，motor_control
     * 会把缺少的输出保存为停止；多于 8 路时，本节点只使用前 8 路。
     * 如果映射失败，motor_control 会把全部输出命令安全置零。
@@ -929,8 +954,11 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
     }
 
     /*
-     * DirectionCommand 已经解码到 direction_command 中。
-     * 下一步在这里调用独立模块，校验并执行对应电机的换向操作。
+     * 回调只提交解码结果。当前模块负责校验并暂存，后续状态机会在主循环
+     * 中安全地发送 DShot 特殊命令，不在 libcanard 回调中阻塞等待。
      */
+    (void)DirectionCommand_Submit(&direction_command,
+                                  transfer->source_node_id,
+                                  transfer->timestamp_usec);
   }
 }

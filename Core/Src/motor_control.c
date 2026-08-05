@@ -91,6 +91,78 @@ bool MotorControl_AreAllDShotCommandsStopped(void)
   return true;
 }
 
+bool MotorControl_SetDShotSpecialCommand(uint8_t motor_mask,
+                                         uint16_t special_command)
+{
+  uint16_t next_dshot_commands[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT] = {0};
+  uint16_t next_dshot_frames[MOTOR_CONTROL_DSHOT_OUTPUT_COUNT] = {0};
+  uint32_t next_dshot_ccr_values[DSHOT_FRAME_BIT_COUNT];
+  uint8_t i;
+  uint8_t bit_index;
+
+  /*
+   * 0表示普通停止命令，不属于本接口要处理的特殊命令；48以上已经进入
+   * 普通油门区间。motor_mask为0也没有实际执行对象，因此直接拒绝。
+   */
+  if ((motor_mask == 0U) ||
+      (special_command == 0U) ||
+      (special_command > DSHOT_SPECIAL_COMMAND_MAX_VALUE))
+  {
+    MotorControl_ForceStop();
+    return false;
+  }
+
+  /*
+   * motor_mask的bit0..bit7分别对应DShot1..DShot8。选中的通道写入同一个
+   * 特殊命令，未选中的通道保持0，因此不会影响没有要求换向的电调。
+   */
+  for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
+  {
+    if ((motor_mask & (uint8_t)(1U << i)) != 0U)
+    {
+      next_dshot_commands[i] = special_command;
+    }
+
+    if (!DShot_BuildFrame(next_dshot_commands[i],
+                          false,
+                          &next_dshot_frames[i]))
+    {
+      MotorControl_ForceStop();
+      return false;
+    }
+  }
+
+  /*
+   * 与普通RawCommand路径相同，先完成每一路帧到CCR的转换，再发布命令和帧。
+   * 任何一步失败都恢复8路停止，避免留下只更新了一部分通道的状态。
+   */
+  for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
+  {
+    if (!DShot_BuildCcrValues(next_dshot_frames[i],
+                              next_dshot_ccr_values))
+    {
+      MotorControl_ForceStop();
+      return false;
+    }
+
+    for (bit_index = 0U; bit_index < DSHOT_FRAME_BIT_COUNT; bit_index++)
+    {
+      g_dshot_ccr_values[i][bit_index] =
+          next_dshot_ccr_values[bit_index];
+    }
+  }
+
+  for (i = 0U; i < MOTOR_CONTROL_DSHOT_OUTPUT_COUNT; i++)
+  {
+    g_dshot_commands[i] = next_dshot_commands[i];
+    g_dshot_frames[i] = next_dshot_frames[i];
+  }
+
+  /* 特殊命令执行期间不再把之前的RawCommand视为有效油门。 */
+  g_has_fresh_raw_command = false;
+  return true;
+}
+
 static bool MotorControl_MapRawCommandToDShot(int16_t raw_command,
                                        uint16_t* out_dshot_command)
 {

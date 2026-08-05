@@ -50,6 +50,25 @@ bool MotorControl_HasFreshRawCommand(void);
 bool MotorControl_AreAllDShotCommandsStopped(void);
 
 /**
+ * @brief 让motor_mask选中的输出发送同一个DShot特殊命令，其余输出发送停止帧。
+ *
+ * 该接口供电机换向状态机使用，不接受普通油门值。motor_mask的bit0..bit7
+ * 分别对应DShot1..DShot8；特殊命令必须位于1..47。函数会同时更新命令、
+ * 16-bit帧和CCR缓存，但实际波形仍由TIM7固定周期调度器发送。
+ *
+ * 调用成功后会清除RawCommand的新鲜标志，防止换向过程中旧油门继续有效。
+ * 换向状态机必须在整个特殊命令序列完成前忽略新的普通油门命令。
+ *
+ * @param motor_mask      要执行特殊命令的电机位掩码。
+ * @param special_command DShot特殊命令，合法范围1..47。
+ *
+ * @retval true  8路命令、帧和CCR缓存全部更新成功。
+ * @retval false 参数或编码无效，8路输出已经恢复为停止帧。
+ */
+bool MotorControl_SetDShotSpecialCommand(uint8_t motor_mask,
+                                         uint16_t special_command);
+
+/**
  * @brief 把一个 DroneCAN RawCommand 值映射成单向 DShot 命令。
  *
  * 当前采用安全的单向电调策略：

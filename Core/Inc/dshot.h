@@ -19,6 +19,14 @@ extern "C" {
 #define DSHOT_SPECIAL_COMMAND_MAX_VALUE  47U
 #define DSHOT_THROTTLE_MIN_VALUE         48U
 
+/*
+ * 本项目当前电调使用AM32固件。下面三个值是DShot协议中的特殊命令编号，
+ * 不是本项目自行分配的数值：7恢复正向，8设置反向，12把设置保存到电调。
+ */
+#define DSHOT_COMMAND_SPIN_DIRECTION_NORMAL    7U
+#define DSHOT_COMMAND_SPIN_DIRECTION_REVERSED  8U
+#define DSHOT_COMMAND_SAVE_SETTINGS            12U
+
 /* 一个完整 DShot 帧固定包含 16 bit，并且发送时从最高位开始。 */
 #define DSHOT_FRAME_BIT_COUNT             16U
 
