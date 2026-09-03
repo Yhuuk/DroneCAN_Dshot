@@ -1,0 +1,14 @@
+
+
+#pragma once
+#include <dronecan_dshot.DirectionQuery_req.h>
+#include <dronecan_dshot.DirectionQuery_res.h>
+
+#define DRONECAN_DSHOT_DIRECTIONQUERY_ID 200
+#define DRONECAN_DSHOT_DIRECTIONQUERY_SIGNATURE (0x5C392730EE1BD1E4ULL)
+
+
+#if defined(__cplusplus) && defined(DRONECAN_CXX_WRAPPERS)
+#include <canard/cxx_wrappers.h>
+SERVICE_MESSAGE_CXX_IFACE(dronecan_dshot_DirectionQuery, DRONECAN_DSHOT_DIRECTIONQUERY_ID, DRONECAN_DSHOT_DIRECTIONQUERY_SIGNATURE, DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_MAX_SIZE, DRONECAN_DSHOT_DIRECTIONQUERY_RESPONSE_MAX_SIZE);
+#endif

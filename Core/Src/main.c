@@ -78,6 +78,10 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
+  #ifdef DEBUG
+  __HAL_DBGMCU_FREEZE_IWDG();
+  #endif
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -93,6 +97,7 @@ int main(void)
   MX_CAN1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
+  MX_TIM6_Init();
   MX_TIM7_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */

@@ -1,0 +1,360 @@
+#
+# AM32 ESC direction query service for DroneCAN_Dshot.
+#
+# DroneCAN_Control uses this service to:
+#
+# 1. Start an asynchronous AM32 direction query.
+# 2. Poll the state or result of an existing query.
+#
+# The transaction identity is:
+#
+#     (source_node_id, request_id)
+#
+# source_node_id is provided by the DroneCAN transfer metadata and is not
+# included explicitly in the request payload.
+#
+# This is a vendor-specific DroneCAN service.
+# The default service data type ID is 200.
+#
+
+
+#
+# Request constants
+#
+
+uint8 PROTOCOL_VERSION = 1
+
+uint8 OPERATION_START_QUERY = 1
+uint8 OPERATION_GET_RESULT  = 2
+
+#
+# START_QUERY may stop normal DShot output for several seconds.
+# A confirmation value is required to reduce the risk of an accidental query.
+#
+uint16 CONFIRMATION_VALUE = 21930    # 0x55AA
+
+
+#
+# Request fields
+#
+
+#
+# DirectionQuery protocol version used by DroneCAN_Control.
+#
+# The sender shall set this field to PROTOCOL_VERSION.
+#
+uint8 protocol_version
+
+#
+# Requested operation:
+#
+# OPERATION_START_QUERY:
+#   Starts a new asynchronous AM32 direction query.
+#
+# OPERATION_GET_RESULT:
+#   Reads the state or result of an existing query.
+#
+uint8 operation
+
+#
+# bit0..bit7 correspond to DShot1..DShot8.
+#
+# OPERATION_START_QUERY:
+#   Selects the motors whose direction shall be read.
+#   Zero is invalid.
+#
+# OPERATION_GET_RESULT:
+#   The sender shall set this field to zero.
+#   The receiver shall ignore this field.
+#
+uint8 motor_mask
+
+#
+# Transaction identifier assigned by DroneCAN_Control.
+#
+# The complete transaction identity is:
+#
+#     (source_node_id, request_id)
+#
+# request_id is independent for every source node.
+#
+# START_QUERY idempotency rules:
+#
+# 1. Same source_node_id, same request_id and same motor_mask:
+#
+#    - Return STATUS_IN_PROGRESS if the query is still running.
+#    - Return STATUS_COMPLETE if the cached query completed successfully.
+#    - Return STATUS_INTERNAL_ERROR if the cached query completed with a
+#      maintenance or internal error.
+#    - The query shall not be restarted.
+#
+# 2. Same source_node_id and same request_id, but a different motor_mask:
+#
+#    - Return STATUS_INVALID_REQUEST.
+#    - The existing or cached query shall not be changed.
+#
+# 3. A different transaction while another query is running:
+#
+#    - Return STATUS_BUSY.
+#    - active_source_node_id and active_request_id identify the running query.
+#
+# DroneCAN_Dshot shall retain at least the currently running transaction and
+# the most recently completed transaction.
+#
+uint16 request_id
+
+#
+# OPERATION_START_QUERY:
+#   Must equal CONFIRMATION_VALUE.
+#
+# OPERATION_GET_RESULT:
+#   The sender shall set this field to zero.
+#   The receiver shall ignore this field.
+#
+uint16 confirmation
+
+
+#
+# Request/response separator
+#
+
+---
+
+
+#
+# Response constants
+#
+
+uint8 PROTOCOL_VERSION = 1
+
+#
+# The query was accepted and has just been started.
+#
+uint8 STATUS_ACCEPTED = 1
+
+#
+# The identified query exists and is still running.
+#
+uint8 STATUS_IN_PROGRESS = 2
+
+#
+# The identified query has finished normally.
+#
+# Individual motors may still have final failure bits.
+# maintenance_error shall be zero for this status.
+#
+uint8 STATUS_COMPLETE = 3
+
+#
+# Another transaction currently owns the AM32/DShot maintenance subsystem.
+#
+uint8 STATUS_BUSY = 4
+
+#
+# The query could not start because the motors were not in a safe stopped
+# state, a direction-write operation was active, or another safety condition
+# was not satisfied.
+#
+uint8 STATUS_NOT_SAFE = 5
+
+#
+# The request contains an invalid operation, zero motor_mask for START_QUERY,
+# an invalid confirmation value, or reuses the same transaction identity with
+# a different motor_mask.
+#
+uint8 STATUS_INVALID_REQUEST = 6
+
+#
+# GET_RESULT refers to a transaction that is neither running nor retained in
+# the completed-result cache.
+#
+uint8 STATUS_NOT_FOUND = 7
+
+#
+# The query encountered an internal or maintenance-mode failure.
+#
+# Direction and per-motor failure masks may still contain usable partial
+# results, but the DShot subsystem shall not be considered safely restored.
+#
+uint8 STATUS_INTERNAL_ERROR = 8
+
+#
+# request.protocol_version is not supported by DroneCAN_Dshot.
+#
+# This is different from unsupported_mask, which reports individual ESC
+# Bootloader protocol incompatibility.
+#
+uint8 STATUS_UNSUPPORTED_VERSION = 9
+
+
+#
+# Maintenance error bit mask values
+#
+
+#
+# DroneCAN_Dshot failed to stop normal DShot operation or failed to enter
+# GPIO/AM32 maintenance mode.
+#
+uint8 MAINTENANCE_ERROR_ENTER_FAILED = 1
+
+#
+# One or more ESCs could not be sent the command used to leave the AM32
+# Bootloader and run the normal ESC application.
+#
+uint8 MAINTENANCE_ERROR_BOOTLOADER_EXIT_FAILED = 2
+
+#
+# DroneCAN_Dshot failed to restore the GPIO alternate functions, TIM1/TIM2,
+# DMA, TIM7 scheduling, or normal zero-throttle DShot output.
+#
+uint8 MAINTENANCE_ERROR_DSHOT_RESTORE_FAILED = 4
+
+
+#
+# Response fields
+#
+
+#
+# DirectionQuery protocol version used by DroneCAN_Dshot.
+#
+# DroneCAN_Dshot shall set this to its supported PROTOCOL_VERSION, including
+# when returning STATUS_UNSUPPORTED_VERSION.
+#
+uint8 protocol_version
+
+#
+# One of the STATUS_* values defined above.
+#
+uint8 status
+
+#
+# Echoes request_id from this service request.
+#
+uint16 request_id
+
+#
+# Source node ID belonging to active_request_id.
+#
+# This field identifies the owner of the currently running query or the most
+# recently completed cached query.
+#
+# Zero means that no active or cached transaction is available.
+#
+uint8 active_source_node_id
+
+#
+# Request ID belonging to active_source_node_id.
+#
+# Zero shall be used when active_source_node_id is zero.
+#
+uint16 active_request_id
+
+#
+# Motor mask belonging to:
+#
+#     (active_source_node_id, active_request_id)
+#
+# For an accepted, running or completed query, this is the motor_mask supplied
+# by the original START_QUERY request.
+#
+# Zero shall be used when no active or cached transaction is available.
+#
+uint8 query_motor_mask
+
+#
+# Motors for which a valid direction value was obtained.
+#
+# bit0..bit7 correspond to DShot1..DShot8.
+#
+uint8 valid_mask
+
+#
+# Motors whose persistent AM32 direction configuration is Reversed.
+#
+# A valid direction bit is interpreted as:
+#
+#   valid=1, reversed=0: Normal
+#   valid=1, reversed=1: Reversed
+#   valid=0:            Unknown
+#
+# reversed_mask shall always be a subset of valid_mask.
+#
+uint8 reversed_mask
+
+#
+# Motors whose final query attempt timed out.
+#
+uint8 timeout_mask
+
+#
+# Motors whose final response failed CRC validation.
+#
+uint8 crc_error_mask
+
+#
+# Motors whose AM32 Bootloader protocol does not support the required EEPROM
+# read operation.
+#
+# This is different from STATUS_UNSUPPORTED_VERSION.
+#
+uint8 unsupported_mask
+
+#
+# Motors that returned an invalid Bootloader identity, invalid ACK, invalid
+# direction value, framing error, malformed response, or another protocol
+# error not represented by the other failure masks.
+#
+uint8 protocol_error_mask
+
+#
+# Bitwise OR of MAINTENANCE_ERROR_* values.
+#
+# STATUS_COMPLETE requires this field to be zero.
+#
+# If this field is non-zero, status shall be STATUS_INTERNAL_ERROR.
+#
+uint8 maintenance_error
+
+
+#
+# Result mask invariants
+#
+# These rules apply to valid_mask, reversed_mask, timeout_mask,
+# crc_error_mask, unsupported_mask and protocol_error_mask.
+#
+# 1. Every result bit shall be a subset of query_motor_mask.
+#
+# 2. reversed_mask shall be a subset of valid_mask.
+#
+# 3. valid_mask shall not overlap any final failure mask.
+#
+# 4. timeout_mask, crc_error_mask, unsupported_mask and protocol_error_mask
+#    shall be pairwise disjoint.
+#
+# 5. The failure masks describe final per-motor results, not transient errors
+#    encountered during earlier retry attempts.
+#
+#    For example, if an attempt times out but a later retry succeeds, the
+#    motor shall appear only in valid_mask and not in timeout_mask.
+#
+# 6. When status is STATUS_COMPLETE:
+#
+#       maintenance_error == 0
+#
+#    and:
+#
+#       valid_mask |
+#       timeout_mask |
+#       crc_error_mask |
+#       unsupported_mask |
+#       protocol_error_mask
+#
+#    shall equal query_motor_mask.
+#
+# 7. Bits outside query_motor_mask shall always be zero.
+#
+# 8. For STATUS_ACCEPTED and STATUS_IN_PROGRESS, all result and failure masks
+#    represent only results already finalized by the implementation.
+#    DroneCAN_Control shall not treat the masks as complete until it receives
+#    STATUS_COMPLETE or STATUS_INTERNAL_ERROR.
+#

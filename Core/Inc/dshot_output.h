@@ -111,6 +111,27 @@ extern "C" {
 HAL_StatusTypeDef DShotOutput_StartPeriodic(void);
 
 /**
+ * @brief 暂停8路DShot并把全部信号线切换成GPIO高电平维护模式。
+ *
+ * 本接口专供AM32 Bootloader单线配置使用。它先停止TIM7调度和两组DMA，
+ * 再关闭TIM1/TIM2四通道PWM，最后将PA0..PA3、PA8..PA11配置为推挽高电平。
+ * 高电平持续期间AM32应用因DShot超时复位，并留在Bootloader等待连接。
+ * 调用前应用层必须已经强制零油门并确认电机停止。
+ */
+HAL_StatusTypeDef DShotOutput_EnterMaintenanceMode(void);
+
+/**
+ * @brief 退出维护模式，恢复DShot引脚复用并重新启动TIM7周期输出。
+ *
+ * 调用前MotorControl缓存应已经是8路停止帧。恢复后不会自动解除应用层的
+ * 连续零油门互锁，避免维护前缓存的油门在ESC重启后立即生效。
+ */
+HAL_StatusTypeDef DShotOutput_ExitMaintenanceMode(void);
+
+/** @brief 查询当前DShot引脚是否由AM32维护模式占用。 */
+bool DShotOutput_IsMaintenanceMode(void);
+
+/**
  * @brief 在主循环中准备下一周期使用的整组双缓冲数据。
  *
  * TIM7中断只提出准备请求，本函数为所有已启用定时器构建相同A/B编号的缓冲。

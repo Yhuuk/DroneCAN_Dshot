@@ -2,6 +2,7 @@
 
 #include "can.h"
 #include "canard.h"
+#include "am32_direction_query.h"
 #include "direction_command.h"
 #include "dshot_output.h"
 #include "motor_control.h"
@@ -86,6 +87,45 @@
  */
 #define DRONECAN_APP_DSHOT_ZERO_HOLD_USEC         1000000ULL
 
+/* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
+/*
+ * 临时上电调试开关：启动TIM7零帧输出后，立即查询DShot1..DShot8的AM32方向。
+ * 查询模块内部还会先保持500 ms零DShot，再拉高信号线3 s进入Bootloader。
+ * 实机验证完成后，可删除本调试块、DroneCAN_DebugCaptureAM32Result()及Init/Poll
+ * 中带相同标记的调用，不影响正式的DroneCAN方向查询接口。
+ */
+#define DRONECAN_APP_DEBUG_AM32_QUERY_ON_BOOT      1U
+#define DRONECAN_APP_DEBUG_AM32_QUERY_MOTOR_MASK   \
+    AM32_DIRECTION_QUERY_ALL_MOTORS
+
+/* g_am32_debug_direction[]每个元素的可读值。 */
+#define DRONECAN_APP_DEBUG_DIRECTION_UNKNOWN       0U
+#define DRONECAN_APP_DEBUG_DIRECTION_NORMAL        1U
+#define DRONECAN_APP_DEBUG_DIRECTION_REVERSED      2U
+#define DRONECAN_APP_DEBUG_STATUS_NOT_QUERIED      0xFFU
+
+/*
+ * 以下变量故意不加static并使用volatile，便于Keil/VS Code Watch直接按名称观察。
+ * 数组索引0..7分别对应DShot1..DShot8。
+ */
+volatile uint8_t g_am32_debug_query_started;
+volatile uint8_t g_am32_debug_query_start_failed;
+volatile uint8_t g_am32_debug_query_finished;
+volatile uint8_t g_am32_debug_direction[AM32_DIRECTION_QUERY_MOTOR_COUNT];
+volatile uint8_t g_am32_debug_status[AM32_DIRECTION_QUERY_MOTOR_COUNT];
+volatile uint8_t g_am32_debug_query_motor_mask;
+volatile uint8_t g_am32_debug_valid_mask;
+volatile uint8_t g_am32_debug_reversed_mask;
+volatile uint8_t g_am32_debug_timeout_mask;
+volatile uint8_t g_am32_debug_crc_error_mask;
+volatile uint8_t g_am32_debug_unsupported_mask;
+volatile uint8_t g_am32_debug_protocol_error_mask;
+volatile uint8_t g_am32_debug_maintenance_error;
+volatile uint32_t g_am32_debug_query_started_ms;
+volatile uint32_t g_am32_debug_query_finished_ms;
+volatile uint32_t g_am32_debug_query_duration_ms;
+/* USER CODE END TEMPORARY AM32 BOOT DEBUG */
+
 //timestamp_usec 是一个 64 位的时间戳，单位是微秒。这个时间戳是 libcanard 用来计算传输超时的。
 //DroneCAN_RxQueueItem 是一个结构体，表示从 CAN 接收队列中取出的一帧数据。它包含了 CAN 帧的头信息、数据和时间戳。
 typedef struct
@@ -120,6 +160,7 @@ static volatile uint32_t g_raw_command_received_count = 0U;
 static volatile uint32_t g_raw_command_decode_error_count = 0U;
 static volatile uint32_t g_raw_command_mapping_error_count = 0U;
 static volatile uint32_t g_raw_command_ignored_while_direction_count = 0U;
+static volatile uint32_t g_raw_command_ignored_while_am32_query_count = 0U;
 
 typedef enum
 {
@@ -181,6 +222,10 @@ static void DroneCAN_EnterDShotWaitZeroState(void);
 static void DroneCAN_HandleMappedRawCommand(uint64_t timestamp_usec);
 static void DroneCAN_PollDShotState(uint64_t now_usec);
 static void DroneCAN_PollDShotSend(void);
+/* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
+static void DroneCAN_DebugInitAM32Result(void);
+static void DroneCAN_DebugCaptureAM32Result(uint64_t now_usec);
+/* USER CODE END TEMPORARY AM32 BOOT DEBUG */
 
 
 /**
@@ -195,6 +240,10 @@ static void DroneCAN_PollDShotSend(void);
  */
 HAL_StatusTypeDef DroneCAN_App_Init(void)
 {
+  /* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
+  DroneCAN_DebugInitAM32Result();
+  /* USER CODE END TEMPORARY AM32 BOOT DEBUG */
+
   /*
    * 在第一次启动DMA之前先构建8路有效停止帧。后面的周期启动函数还会把
    * TIM2和TIM1的A/B两块DMA缓冲区都准备为停止帧，因此TIM7第一个1.5 ms节拍
@@ -202,6 +251,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
    */
   MotorControl_Init();
   DirectionCommand_Init();
+  AM32DirectionQuery_Init();
   g_dshot_state = DRONECAN_DSHOT_STATE_WAIT_ZERO;
   DroneCAN_ResetDShotZeroHold();
 
@@ -258,6 +308,24 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
     return HAL_ERROR;
   }
 
+  /* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
+#if DRONECAN_APP_DEBUG_AM32_QUERY_ON_BOOT
+  /*
+   * 此时TIM7已经开始周期发送8路停止帧。Start成功后查询立即取得输出控制权，
+   * 所以上电期间收到的RawCommand不会在方向读取完成前驱动电机。
+   */
+  g_am32_debug_query_started_ms = HAL_GetTick();
+  if (!AM32DirectionQuery_Start(
+          DRONECAN_APP_DEBUG_AM32_QUERY_MOTOR_MASK,
+          DroneCAN_GetTimestampUsec()))
+  {
+    g_am32_debug_query_start_failed = 1U;
+    return HAL_ERROR;
+  }
+  g_am32_debug_query_started = 1U;
+#endif
+  /* USER CODE END TEMPORARY AM32 BOOT DEBUG */
+
   return HAL_OK;
 }
 
@@ -265,6 +333,7 @@ void DroneCAN_App_Poll(void)
 {
   DroneCAN_RxQueueItem item;
   uint64_t now_usec;
+  bool query_was_busy;
 
   /*
    * 当前第一步还没有接入周期任务。
@@ -318,6 +387,29 @@ void DroneCAN_App_Poll(void)
   MotorControl_Poll(now_usec);
 
   /*
+   * AM32查询从Start成功起独占8路输出。高电平等待阶段是非阻塞的；单路串口
+   * 事务由TIM6/EXTI逐bit推进。查询刚结束的这一轮也强制回到WAIT_ZERO，防止
+   * ESC重启后直接恢复维护前缓存的油门。
+   */
+  query_was_busy = AM32DirectionQuery_IsBusy();
+  AM32DirectionQuery_Poll(now_usec);
+
+  /* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
+  if (query_was_busy && (!AM32DirectionQuery_IsBusy()))
+  {
+    DroneCAN_DebugCaptureAM32Result(now_usec);
+  }
+  /* USER CODE END TEMPORARY AM32 BOOT DEBUG */
+
+  if (query_was_busy || AM32DirectionQuery_IsBusy())
+  {
+    g_dshot_state = DRONECAN_DSHOT_STATE_WAIT_ZERO;
+    DroneCAN_ResetDShotZeroHold();
+    DShotOutput_PollPreparation();
+    return;
+  }
+
+  /*
    * 换向状态机在主循环中推进，不在libcanard回调或TIM7中断里阻塞等待。
    * 执行期间保持启动互锁为WAIT_ZERO，但不能调用EnterDShotWaitZeroState()，
    * 因为那个函数会强制写入停止帧，进而覆盖状态机正在发送的特殊命令。
@@ -344,6 +436,95 @@ void DroneCAN_App_Poll(void)
    */
   DroneCAN_PollDShotSend();
 }
+
+bool DroneCAN_App_StartAM32DirectionQuery(uint8_t motor_mask)
+{
+  if (DirectionCommand_IsBusy() || AM32DirectionQuery_IsBusy())
+  {
+    return false;
+  }
+
+  return AM32DirectionQuery_Start(motor_mask, DroneCAN_GetTimestampUsec());
+}
+
+bool DroneCAN_App_GetAM32DirectionResult(AM32DirectionQueryResult* out_result)
+{
+  return AM32DirectionQuery_GetLastResult(out_result);
+}
+
+/* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
+static void DroneCAN_DebugInitAM32Result(void)
+{
+  uint8_t i;
+
+  g_am32_debug_query_started = 0U;
+  g_am32_debug_query_start_failed = 0U;
+  g_am32_debug_query_finished = 0U;
+  g_am32_debug_query_motor_mask = 0U;
+  g_am32_debug_valid_mask = 0U;
+  g_am32_debug_reversed_mask = 0U;
+  g_am32_debug_timeout_mask = 0U;
+  g_am32_debug_crc_error_mask = 0U;
+  g_am32_debug_unsupported_mask = 0U;
+  g_am32_debug_protocol_error_mask = 0U;
+  g_am32_debug_maintenance_error = 0U;
+  g_am32_debug_query_started_ms = 0U;
+  g_am32_debug_query_finished_ms = 0U;
+  g_am32_debug_query_duration_ms = 0U;
+
+  for (i = 0U; i < AM32_DIRECTION_QUERY_MOTOR_COUNT; i++)
+  {
+    g_am32_debug_direction[i] = DRONECAN_APP_DEBUG_DIRECTION_UNKNOWN;
+    g_am32_debug_status[i] = DRONECAN_APP_DEBUG_STATUS_NOT_QUERIED;
+  }
+}
+
+static void DroneCAN_DebugCaptureAM32Result(uint64_t now_usec)
+{
+  AM32DirectionQueryResult result;
+  uint8_t i;
+
+  if (!AM32DirectionQuery_GetLastResult(&result))
+  {
+    return;
+  }
+
+  g_am32_debug_query_motor_mask = result.requested_mask;
+  g_am32_debug_valid_mask = result.valid_mask;
+  g_am32_debug_reversed_mask = result.reversed_mask;
+  g_am32_debug_timeout_mask = result.timeout_mask;
+  g_am32_debug_crc_error_mask = result.crc_error_mask;
+  g_am32_debug_unsupported_mask = result.unsupported_mask;
+  g_am32_debug_protocol_error_mask = result.protocol_error_mask;
+  g_am32_debug_maintenance_error = result.maintenance_error ? 1U : 0U;
+
+  for (i = 0U; i < AM32_DIRECTION_QUERY_MOTOR_COUNT; i++)
+  {
+    uint8_t motor_bit = (uint8_t)(1U << i);
+
+    g_am32_debug_status[i] = (uint8_t)result.status[i];
+    if ((result.valid_mask & motor_bit) == 0U)
+    {
+      g_am32_debug_direction[i] = DRONECAN_APP_DEBUG_DIRECTION_UNKNOWN;
+    }
+    else if ((result.reversed_mask & motor_bit) != 0U)
+    {
+      g_am32_debug_direction[i] = DRONECAN_APP_DEBUG_DIRECTION_REVERSED;
+    }
+    else
+    {
+      g_am32_debug_direction[i] = DRONECAN_APP_DEBUG_DIRECTION_NORMAL;
+    }
+  }
+
+  g_am32_debug_query_finished_ms = (uint32_t)(now_usec / 1000ULL);
+  g_am32_debug_query_duration_ms =
+      g_am32_debug_query_finished_ms - g_am32_debug_query_started_ms;
+
+  /* finished最后发布，看到1时，上面的所有结果字段都已经完成更新。 */
+  g_am32_debug_query_finished = 1U;
+}
+/* USER CODE END TEMPORARY AM32 BOOT DEBUG */
 
 // HAL_CAN_RxFifo0MsgPendingCallback()是 HAL CAN driver 的一个回调函数。当 CAN1 的 RX FIFO0 里至少有一帧 CAN 数据时，HAL 会调用这个函数。这个函数的作用是把 FIFO0 里的所有帧都读出来，并暂时丢弃。
 //本阶段补充：现在读出来后不再丢弃，而是写入 RX ring buffer，等待主循环交给 libcanard。
@@ -900,12 +1081,19 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
      * 收到的RawCommand用于调试，但绝不能让普通油门覆盖方向/保存特殊命令。
      * 换向完成后还会重新执行连续零帧启动互锁，不会直接恢复这条旧油门。
      */
-    if (DirectionCommand_IsBusy())
+    if (DirectionCommand_IsBusy() || AM32DirectionQuery_IsBusy())
     {
       g_last_raw_command = raw_command;
       g_last_raw_command_source_node_id = transfer->source_node_id;
       g_raw_command_received_count++;
-      g_raw_command_ignored_while_direction_count++;
+      if (AM32DirectionQuery_IsBusy())
+      {
+        g_raw_command_ignored_while_am32_query_count++;
+      }
+      else
+      {
+        g_raw_command_ignored_while_direction_count++;
+      }
       return;
     }
 
@@ -957,8 +1145,11 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
      * 回调只提交解码结果。当前模块负责校验并暂存，后续状态机会在主循环
      * 中安全地发送 DShot 特殊命令，不在 libcanard 回调中阻塞等待。
      */
-    (void)DirectionCommand_Submit(&direction_command,
-                                  transfer->source_node_id,
-                                  transfer->timestamp_usec);
+    if (!AM32DirectionQuery_IsBusy())
+    {
+      (void)DirectionCommand_Submit(&direction_command,
+                                    transfer->source_node_id,
+                                    transfer->timestamp_usec);
+    }
   }
 }

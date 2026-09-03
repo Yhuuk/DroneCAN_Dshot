@@ -50,9 +50,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dshot.c
     Core/Src/motor_control.c
     Core/Src/direction_command.c
+    Core/Src/am32_singlewire.c
+    Core/Src/am32_bootloader.c
+    Core/Src/am32_direction_query.c
     third_party/libcanard/canard.c
     third_party/dronecan_dsdl_generated/src/uavcan.equipment.esc.RawCommand.c
     third_party/dronecan_dsdl_generated/src/dronecan_dshot.DirectionCommand.c
+    third_party/dronecan_dsdl_generated/src/dronecan_dshot.DirectionQuery_res.c
+    third_party/dronecan_dsdl_generated/src/dronecan_dshot.DirectionQuery_req.c
 )
 
 # Add include paths

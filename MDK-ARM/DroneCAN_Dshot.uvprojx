@@ -409,6 +409,26 @@
               <FilePath>..\Core\Src\dshot_output.c</FilePath>
             </File>
             <File>
+              <FileName>direction_command.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\direction_command.c</FilePath>
+            </File>
+            <File>
+              <FileName>am32_singlewire.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\am32_singlewire.c</FilePath>
+            </File>
+            <File>
+              <FileName>am32_bootloader.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\am32_bootloader.c</FilePath>
+            </File>
+            <File>
+              <FileName>am32_direction_query.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\am32_direction_query.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>
@@ -639,6 +659,11 @@
               <FileName>uavcan.equipment.esc.RawCommand.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\third_party\dronecan_dsdl_generated\src\uavcan.equipment.esc.RawCommand.c</FilePath>
+            </File>
+            <File>
+              <FileName>dronecan_dshot.DirectionCommand.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\third_party\dronecan_dsdl_generated\src\dronecan_dshot.DirectionCommand.c</FilePath>
             </File>
           </Files>
         </Group>

@@ -19,6 +19,10 @@
 #define DSHOT_OUTPUT_TIM7_EXPECTED_PRESCALER   47U
 #define DSHOT_OUTPUT_TIM7_EXPECTED_PERIOD      1499U
 
+#define DSHOT_OUTPUT_ALL_GPIO_PINS             \
+    (Dshot1_Pin | Dshot2_Pin | Dshot3_Pin | Dshot4_Pin | \
+     Dshot5_Pin | Dshot6_Pin | Dshot7_Pin | Dshot8_Pin)
+
 /*
  * 统一使用结构体上下文分别描述两个个TIM的状态。
  * 旧变量与新位置的对应关系如下，旧的独立全局标志位已经被结构体成员替换：
@@ -142,6 +146,7 @@ static DShotOutputTimerContext* const
 };
 
 static DShotOutputScheduler g_dshot_scheduler;
+static volatile bool g_dshot_maintenance_active;
 
 static HAL_StatusTypeDef DShotOutput_StartFourPwmChannelsLow(
     TIM_HandleTypeDef* htim);
@@ -282,7 +287,8 @@ HAL_StatusTypeDef DShotOutput_StartPeriodic(void)
   uint32_t previous_primask;
   uint8_t context_index;
 
-  if ((htim7.Instance != TIM7) ||
+  if (g_dshot_maintenance_active ||
+      (htim7.Instance != TIM7) ||
       (htim7.Init.Prescaler != DSHOT_OUTPUT_TIM7_EXPECTED_PRESCALER) ||
       (htim7.Init.Period != DSHOT_OUTPUT_TIM7_EXPECTED_PERIOD))
   {
@@ -393,6 +399,91 @@ HAL_StatusTypeDef DShotOutput_StartPeriodic(void)
   }
 
   return status;
+}
+
+HAL_StatusTypeDef DShotOutput_EnterMaintenanceMode(void)
+{
+  GPIO_InitTypeDef gpio = {0};
+  uint32_t previous_primask;
+  uint8_t context_index;
+
+  previous_primask = DShotOutput_EnterCritical();
+
+  //g_dshot_maintenance_active 是一个全局变量，表示当前是否处于维护模式。如果已经处于维护模式，则不能再次进入维护模式，返回HAL_BUSY。
+  if (g_dshot_maintenance_active)
+  {
+    DShotOutput_ExitCritical(previous_primask);
+    return HAL_BUSY;
+  }
+
+  /* 先撤销调度许可，保证已经挂起的TIM7中断也不会再启动一帧DMA。 */
+  g_dshot_scheduler.periodic_started = false;
+  g_dshot_scheduler.prepare_requested = false;
+  g_dshot_scheduler.prepare_in_progress = false;
+  g_dshot_scheduler.ready_buffer_available = false;
+  DShotOutput_ExitCritical(previous_primask);
+
+  (void)HAL_TIM_Base_Stop_IT(&htim7);
+
+  for (context_index = 0U;
+       context_index < DSHOT_OUTPUT_TIMER_CONTEXT_COUNT;
+       context_index++)
+  {
+    DShotOutputTimerContext* context =
+        g_dshot_timer_contexts[context_index];
+
+    DShotOutput_StopTimerGroup(context->htim);
+
+    /*
+     * 正常帧间不能停PWM，否则信号线可能悬空；维护模式却必须把引脚交还GPIO，
+     * 因此这里明确关闭四个CC输出，并清除“只启动一次”状态。
+     */
+    (void)HAL_TIM_PWM_Stop(context->htim, TIM_CHANNEL_1);
+    (void)HAL_TIM_PWM_Stop(context->htim, TIM_CHANNEL_2);
+    (void)HAL_TIM_PWM_Stop(context->htim, TIM_CHANNEL_3);
+    (void)HAL_TIM_PWM_Stop(context->htim, TIM_CHANNEL_4);
+    context->pwm_channels_started = false;
+    context->busy = false;
+  }
+
+  /* 先写高ODR再切输出，避免从AF切到GPIO时在线上制造额外低脉冲。 */
+  GPIOA->BSRR = DSHOT_OUTPUT_ALL_GPIO_PINS;
+  gpio.Pin = DSHOT_OUTPUT_ALL_GPIO_PINS;
+  gpio.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOA, &gpio);
+
+  g_dshot_maintenance_active = true;
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef DShotOutput_ExitMaintenanceMode(void)
+{
+  HAL_StatusTypeDef status;
+
+  if (!g_dshot_maintenance_active)
+  {
+    return HAL_ERROR;
+  }
+
+  /* CubeMX生成的PostInit会分别恢复PA8..11/TIM1和PA0..3/TIM2的AF1。 */
+  HAL_TIM_MspPostInit(&htim1);
+  HAL_TIM_MspPostInit(&htim2);
+  g_dshot_maintenance_active = false;
+
+  status = DShotOutput_StartPeriodic();
+  if (status != HAL_OK)
+  {
+    /* 启动失败时保持明确的非周期状态，交给上层记录维护退出错误。 */
+    g_dshot_scheduler.periodic_started = false;
+  }
+  return status;
+}
+
+bool DShotOutput_IsMaintenanceMode(void)
+{
+  return g_dshot_maintenance_active;
 }
 
 /**

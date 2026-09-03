@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include "main.h"
+#include "am32_direction_query.h"
 
 /**
  * @brief 初始化 DroneCAN 应用层。
@@ -43,6 +44,19 @@ HAL_StatusTypeDef DroneCAN_App_Init(void);
  * 重新进入等待零命令状态；严格1.5 ms发送节拍由TIM7中断独立提供。
  */
 void DroneCAN_App_Poll(void);
+
+/**
+ * @brief 请求读取选中AM32电调的持久化Normal/Reversed配置。
+ *
+ * 当前先提供本地应用接口，后续收到DroneCAN_Control的查询消息时直接调用它。
+ * 请求期间普通RawCommand和方向写命令不会取得电机输出控制权。
+ *
+ * @param motor_mask bit0..bit7对应DShot1..DShot8。
+ */
+bool DroneCAN_App_StartAM32DirectionQuery(uint8_t motor_mask);
+
+/** @brief 复制最近一次已完成的8路AM32方向查询结果。 */
+bool DroneCAN_App_GetAM32DirectionResult(AM32DirectionQueryResult* out_result);
 
 #ifdef __cplusplus
 }
