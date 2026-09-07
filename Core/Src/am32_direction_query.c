@@ -141,7 +141,8 @@ void AM32DirectionQuery_Poll(uint64_t now_usec)
 
       if (DShotOutput_EnterMaintenanceMode() != HAL_OK)
       {
-        g_query_result.maintenance_error = true;
+        g_query_result.maintenance_error |=
+            AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_ENTER_FAILED;
         g_query_maintenance_error_count++;
         AM32DirectionQuery_Finish();
         return;
@@ -224,7 +225,17 @@ void AM32DirectionQuery_Poll(uint64_t now_usec)
          * 进入维护模式时8根线全部保持过高电平，所以即使只请求读取部分通道，
          * 也必须对全部8路发送RUN。失败/未请求通道同样需要退出Bootloader。
          */
-        (void)AM32Bootloader_RunApplication(g_query_channel);
+        if (AM32Bootloader_RunApplication(g_query_channel) !=
+            AM32_BOOTLOADER_OK)
+        {
+          /*
+           * 至少一路电调没有成功收到退出Bootloader并运行应用的命令。
+           * maintenance_error是位掩码，所以多路失败只需保留同一个bit1。
+           */
+          g_query_result.maintenance_error |=
+              AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_BOOTLOADER_EXIT_FAILED;
+          g_query_maintenance_error_count++;
+        }
         g_query_channel++;
         return;
       }
@@ -236,7 +247,8 @@ void AM32DirectionQuery_Poll(uint64_t now_usec)
       MotorControl_ForceStop();
       if (DShotOutput_ExitMaintenanceMode() != HAL_OK)
       {
-        g_query_result.maintenance_error = true;
+        g_query_result.maintenance_error |=
+            AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_DSHOT_RESTORE_FAILED;
         g_query_maintenance_error_count++;
       }
       AM32DirectionQuery_Finish();
@@ -244,7 +256,13 @@ void AM32DirectionQuery_Poll(uint64_t now_usec)
 
     default:
       AM32SingleWire_Abort();
-      g_query_result.maintenance_error = true;
+      /*
+       * 进入未定义状态说明维护流程没有按正常路径恢复。设置bit2保证上层
+       * 将本次事务报告为INTERNAL_ERROR，而不会误报为正常COMPLETE。
+       */
+      g_query_result.maintenance_error |=
+          AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_DSHOT_RESTORE_FAILED;
+      g_query_maintenance_error_count++;
       if (DShotOutput_IsMaintenanceMode())
       {
         (void)DShotOutput_ExitMaintenanceMode();
@@ -301,7 +319,7 @@ static void AM32DirectionQuery_ClearResult(uint8_t motor_mask)
   g_query_result.crc_error_mask = 0U;
   g_query_result.unsupported_mask = 0U;
   g_query_result.protocol_error_mask = 0U;
-  g_query_result.maintenance_error = false;
+  g_query_result.maintenance_error = 0U;
 
   for (i = 0U; i < AM32_DIRECTION_QUERY_MOTOR_COUNT; i++)
   {

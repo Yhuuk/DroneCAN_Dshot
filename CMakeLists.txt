@@ -53,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/am32_singlewire.c
     Core/Src/am32_bootloader.c
     Core/Src/am32_direction_query.c
+    Core/Src/direction_request.c
     third_party/libcanard/canard.c
     third_party/dronecan_dsdl_generated/src/uavcan.equipment.esc.RawCommand.c
     third_party/dronecan_dsdl_generated/src/dronecan_dshot.DirectionCommand.c

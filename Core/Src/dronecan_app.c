@@ -6,8 +6,11 @@
 #include "direction_command.h"
 #include "dshot_output.h"
 #include "motor_control.h"
+#include "direction_request.h"
 
+#include "stm32l4xx_hal_can.h"
 #include "uavcan.equipment.esc.RawCommand.h"
+#include "dronecan_dshot.DirectionQuery.h"
 
 /*
  * 本模块是 STM32 HAL CAN driver 和 libcanard 之间的边界层。
@@ -94,7 +97,7 @@
  * 实机验证完成后，可删除本调试块、DroneCAN_DebugCaptureAM32Result()及Init/Poll
  * 中带相同标记的调用，不影响正式的DroneCAN方向查询接口。
  */
-#define DRONECAN_APP_DEBUG_AM32_QUERY_ON_BOOT      1U
+#define DRONECAN_APP_DEBUG_AM32_QUERY_ON_BOOT      0U
 #define DRONECAN_APP_DEBUG_AM32_QUERY_MOTOR_MASK   \
     AM32_DIRECTION_QUERY_ALL_MOTORS
 
@@ -198,6 +201,9 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
                                           uint16_t data_type_id,
                                           CanardTransferType transfer_type,
                                           uint8_t source_node_id);
+
+static HAL_StatusTypeDef DroneCAN_FlushTXQueue(void);
+
 static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void);
 
 //DroneCAN_RxQueueNextIndex是要用记录队列的下一个索引。这个函数的作用是计算环形队列的下一个索引，确保索引在队列大小范围内循环。
@@ -252,6 +258,7 @@ HAL_StatusTypeDef DroneCAN_App_Init(void)
   MotorControl_Init();
   DirectionCommand_Init();
   AM32DirectionQuery_Init();
+  DirectionRequest_Init();
   g_dshot_state = DRONECAN_DSHOT_STATE_WAIT_ZERO;
   DroneCAN_ResetDShotZeroHold();
 
@@ -376,6 +383,13 @@ void DroneCAN_App_Poll(void)
     }
   }
 
+  /**
+   * 刷新 TX 队列
+   * 
+   * DroneCAN_FlushTXQueue 函数需要放在AM32DirectionQuery_Poll() 和查询期间的提前 return 之前。
+   */
+  DroneCAN_FlushTXQueue();
+
   /*
    * 超时检查放在主循环，不放在 CAN 中断中。即使当前没有收到新 CAN 帧，
    * 只要 DroneCAN_App_Poll() 持续运行，100 ms 保护仍然会按时生效。
@@ -393,6 +407,13 @@ void DroneCAN_App_Poll(void)
    */
   query_was_busy = AM32DirectionQuery_IsBusy();
   AM32DirectionQuery_Poll(now_usec);
+
+  /*
+   * AM32底层查询可能在上面的Poll中完成。这里立即把底层结果转存到
+   * DirectionRequest事务缓存，使之后的GET_RESULT能够返回COMPLETE或
+   * INTERNAL_ERROR，而不是让活动事务永久停留在IN_PROGRESS。
+   */
+  DirectionRequest_Poll();
 
   /* USER CODE BEGIN TEMPORARY AM32 BOOT DEBUG */
   if (query_was_busy && (!AM32DirectionQuery_IsBusy()))
@@ -496,7 +517,8 @@ static void DroneCAN_DebugCaptureAM32Result(uint64_t now_usec)
   g_am32_debug_crc_error_mask = result.crc_error_mask;
   g_am32_debug_unsupported_mask = result.unsupported_mask;
   g_am32_debug_protocol_error_mask = result.protocol_error_mask;
-  g_am32_debug_maintenance_error = result.maintenance_error ? 1U : 0U;
+  /* maintenance_error现在是位掩码，必须完整保留bit0..bit2。 */
+  g_am32_debug_maintenance_error = result.maintenance_error;
 
   for (i = 0U; i < AM32_DIRECTION_QUERY_MOTOR_COUNT; i++)
   {
@@ -806,6 +828,8 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
   uint32_t dronecan_raw_command_mask;
   uint32_t dronecan_direction_command_id;
   uint32_t dronecan_direction_command_mask;
+  uint32_t dronecan_direction_query_request_id;
+  uint32_t dronecan_direction_query_request_mask;
   uint32_t bxcan_filter_id;
   uint32_t bxcan_filter_mask;
 
@@ -953,6 +977,51 @@ static HAL_StatusTypeDef DroneCAN_ConfigCanFilter(void)
   filter.FilterMaskIdHigh = (bxcan_filter_mask >> 16U) & 0xFFFFU;
   filter.FilterMaskIdLow = bxcan_filter_mask & 0xFFFFU;
 
+  status = HAL_CAN_ConfigFilter(&hcan1, &filter);
+  if (status != HAL_OK)
+  {
+    /* Bank 0 配置失败时立即返回，不能带着不确定的 RawCommand 接收状态继续启动。 */
+    return status;
+  }
+
+
+  /**
+   * 配置 获取AM32 转向状态 的 CAN 硬件过滤器
+   */
+
+  dronecan_direction_query_request_id =
+      ((uint32_t)DRONECAN_DSHOT_DIRECTIONQUERY_ID << 16U) |
+      ((uint32_t)1 << 15U) | 
+      ((uint32_t)DRONECAN_APP_NODE_ID << 8U) |
+      ((uint32_t)1 << 7U) | 
+      (uint32_t)DIRECTION_REQUEST_ALLOWED_SOURCE_NODE_ID;
+
+  dronecan_direction_query_request_mask =
+      (0xFFUL << 16U) |
+      (1UL << 15U) | 
+      (0x7FUL << 8U) |
+      (1UL << 7U) |
+      (0x7FUL);
+
+  /**
+   * bxcan_filter_id 的bit1应该是0（所以不写就表示0，不用移位了），表示数据帧；bit2应该是1，表示扩展帧。
+   * bxcan_filter_mask 的bit1应该是1，表示比较数据帧
+   */
+  bxcan_filter_id =
+      (dronecan_direction_query_request_id << 3U) | 
+      CAN_ID_EXT;
+
+  bxcan_filter_mask =
+      (dronecan_direction_query_request_mask << 3U) |
+      CAN_ID_EXT |
+      (1UL << 1U);
+
+  filter.FilterBank = 2;
+  filter.FilterIdHigh = (bxcan_filter_id >> 16U) & 0xFFFFU;
+  filter.FilterIdLow = bxcan_filter_id & 0xFFFFU;
+  filter.FilterMaskIdHigh = (bxcan_filter_mask >> 16U) & 0xFFFFU;
+  filter.FilterMaskIdLow = bxcan_filter_mask & 0xFFFFU;
+
   /*
    * Mode、Scale、FIFO 和 Activation 沿用上面已经填写的公共配置。
    * 两个 bank 都指向 FIFO0，所以后续仍由现有的 RX FIFO0 中断、软件环形
@@ -1014,6 +1083,17 @@ static bool DroneCAN_ShouldAcceptTransfer(const CanardInstance* ins,
     *out_data_type_signature = DRONECAN_DSHOT_DIRECTIONCOMMAND_SIGNATURE;
     return true;
   }
+  else if ((transfer_type == CanardTransferTypeRequest) &&
+           (data_type_id == DRONECAN_DSHOT_DIRECTIONQUERY_ID) &&
+           (source_node_id == DIRECTION_REQUEST_ALLOWED_SOURCE_NODE_ID))
+  {
+    /*
+     * DirectionQuery 的签名由自定义 DSDL 生成文件统一提供。
+     * 这里再次检查 source node ID，作为硬件过滤器之后的软件层校验。
+     */
+    *out_data_type_signature = DRONECAN_DSHOT_DIRECTIONQUERY_SIGNATURE;
+    return true;
+  }
 
   return false;
 }
@@ -1037,6 +1117,16 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
 {
   (void)ins;
 
+  if(transfer ->transfer_type == CanardTransferTypeRequest &&
+     transfer ->data_type_id == DRONECAN_DSHOT_DIRECTIONQUERY_ID)
+  {
+    /**
+     * 如果是 CanardTransferTypeRequest类型，跳转到专门的处理函数中
+     */
+    DirectionRequest_Handle(ins,transfer);
+    return;
+  }
+
   /*
    * 只有当 DroneCAN_ShouldAcceptTransfer() 返回 true，并且 libcanard 已经把
    * 一个完整 transfer 重组完成后，才会进入这个 callback。
@@ -1048,8 +1138,8 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
    * 本阶段再次补充：DirectionCommand 已经能够进入独立分支并完成 DSDL
    * 解码，具体的电机换向处理将在后续 direction_command 模块中实现。
    */
-  if ((transfer->transfer_type != CanardTransferTypeBroadcast) ||
-      ((transfer->data_type_id != UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID) &&
+  if (transfer ->transfer_type != CanardTransferTypeBroadcast  ||
+     ((transfer->data_type_id != UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID) &&
        (transfer->data_type_id != DRONECAN_DSHOT_DIRECTIONCOMMAND_ID)))
   {
     /*
@@ -1151,5 +1241,76 @@ static void DroneCAN_OnTransferReceived(CanardInstance* ins,
                                     transfer->source_node_id,
                                     transfer->timestamp_usec);
     }
+  }
+}
+
+
+static HAL_StatusTypeDef DroneCAN_FlushTXQueue(void)
+{
+  /*
+   * canardRequestOrRespond()/canardBroadcast() 只负责把组装完成的 CAN 帧
+   * 放进 libcanard 的发送队列，并不会直接操作 STM32 的 CAN 外设。
+   * 本函数负责把 libcanard 队首帧逐个提交到 CAN1 的硬件发送邮箱。
+   */
+  CAN_TxHeaderTypeDef tx_header = {0};
+  uint32_t tx_mailbox = 0U;
+
+  /*
+   * DroneCAN 使用 29-bit 扩展数据帧。StdId 在 IDE=CAN_ID_EXT 时不会使用，
+   * 其余每一帧都保持这些固定属性，只更新 ExtId 和 DLC。
+   * 
+   * TransmitGlobalTime 这个参数是 bxCAN 的一个扩展功能，允许在发送的 CAN 帧中附带一个全局时间戳。DroneCAN 协议不需要这个功能，所以这里禁用它。 
+   */
+  tx_header.IDE = CAN_ID_EXT;
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.TransmitGlobalTime = DISABLE;
+
+  for (;;)
+  {
+    const CanardCANFrame* frame;
+    HAL_StatusTypeDef status;
+
+    /*
+     * Peek 只查看当前最高优先级帧，不会将其从 libcanard 队列删除。
+     * 队列为空说明本轮所有待发送帧都已成功交给 CAN 硬件。
+     */
+    frame = canardPeekTxQueue(&g_canard);
+    if (frame == NULL)
+    {
+      return HAL_OK;
+    }
+
+    /*
+     * bxCAN 共有 3 个发送邮箱。邮箱全部占用时不等待，也不删除队首帧，
+     * 返回 HAL_BUSY，下一次主循环再次调用本函数即可继续发送。
+     */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U)
+    {
+      return HAL_BUSY;
+    }
+
+    /*
+     * libcanard 在 id 的高位附带 EFF/RTR/ERR 软件标志；HAL 的 ExtId
+     * 只接收低 29 位 CAN 标识符，所以必须用扩展 ID 掩码去掉这些标志。
+     */
+    tx_header.ExtId = frame->id & CANARD_CAN_EXT_ID_MASK;
+    tx_header.DLC = frame->data_len;
+
+    /*
+     * HAL_CAN_AddTxMessage() 成功只表示该帧已进入硬件发送邮箱，之后由
+     * CAN 外设完成仲裁和发送。若提交失败，必须保留 libcanard 队首帧，
+     * 否则该帧会永久丢失。
+     */
+    status = HAL_CAN_AddTxMessage(&hcan1,
+                                  &tx_header,
+                                  frame->data,
+                                  &tx_mailbox);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
+
+    /* 只有成功提交到硬件邮箱之后，才能从 libcanard 队列中移除该帧。 */
+    canardPopTxQueue(&g_canard);
   }
 }

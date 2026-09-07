@@ -13,6 +13,14 @@ extern "C" {
 #define AM32_DIRECTION_QUERY_MOTOR_COUNT  8U
 #define AM32_DIRECTION_QUERY_ALL_MOTORS   0xFFU
 
+/*
+ * AM32维护过程错误位。数值与DirectionQuery DSDL中的MAINTENANCE_ERROR_*
+ * 保持一致，因此服务层可以直接把该字段复制到DroneCAN响应中。
+ */
+#define AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_ENTER_FAILED            0x01U
+#define AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_BOOTLOADER_EXIT_FAILED  0x02U
+#define AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_DSHOT_RESTORE_FAILED    0x04U
+
 /** 一次查询完成后保留的8路结果；无效通道必须解释为Unknown，不能当作Normal。 */
 typedef struct
 {
@@ -23,7 +31,8 @@ typedef struct
   uint8_t crc_error_mask;
   uint8_t unsupported_mask;
   uint8_t protocol_error_mask;
-  bool maintenance_error;
+  /* 上述AM32_DIRECTION_QUERY_MAINTENANCE_ERROR_*按位或后的结果。 */
+  uint8_t maintenance_error;
 
   AM32BootloaderStatus status[AM32_DIRECTION_QUERY_MOTOR_COUNT];
   AM32BootloaderInfo bootloader_info[AM32_DIRECTION_QUERY_MOTOR_COUNT];
